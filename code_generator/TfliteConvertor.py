@@ -28,7 +28,7 @@ from .tflite import Model
 
 # Parse tflite model into TinyEngine IR format
 class TfliteConvertor(object):
-    def __init__(self, filepath):
+    def __init__(self, filepath, enable_star_forward=True):
         # path to the tflite file
         self.filepath = filepath
         self.model = self.loadTFmodel(filepath)
@@ -37,6 +37,10 @@ class TfliteConvertor(object):
         self.tmpPADIndice = None
         self.skip_transpose = None
         self.average_1D_to_2D_holder = MEAN2D()  # For merging 1D to 2D
+        # set False to parse StarBlock's act(f1)*f2 as plain CONV_2D/CONV_2D/MUL
+        # instead of fusing it into star_forward -- lets callers get an
+        # unfused baseline off the same .tflite file for comparison.
+        self.enable_star_forward = enable_star_forward
 
     # public functions
     def loadTFmodel(self, filepath):
@@ -105,6 +109,15 @@ class TfliteConvertor(object):
                     self.layer.append(SEelementmult_op)
                     continue
 
+                if self.enable_star_forward and self.checkIfRequireStarForward(three_op_sequence):
+                    logging.info("found StarBlock forward (act(f1) * f2)")
+                    skip_next_ops = 2
+                    
+                    star_forward_op = TF_Parser.parse_star_forward(three_op_sequence, self.model, self.layer)
+
+                    self.layer.append(star_forward_op)
+                    continue
+
             # parse the op
             self._handleOperator(op)
 
@@ -139,6 +152,11 @@ class TfliteConvertor(object):
             self._convert_TRANSPOSE(op)
         elif op_code_str == "FULLY_CONNECTED":
             self.layer.append(TF_Parser.parse_fc(op, self.model))
+        elif op_code_str == "MUL":
+            # StarBlock's act(f1) * f2
+            # SE-block MUL->MUL sequence is
+            # intercepted earlier in parseOperatorInfo() and never reaches here
+            self.layer.append(TF_Parser.parse_mul(op, self.model))
         elif op_code_str in SKIP_OPs:
             pass
         else:
@@ -155,6 +173,38 @@ class TfliteConvertor(object):
         ):
             return True
         return False
+
+    #         +-- CONV_2D (1x1, RELU6) --+
+    #   x ----+                          +-- MUL --> star_forward
+    #         +-- CONV_2D (1x1, NONE)  --+
+    def checkIfRequireStarForward(self, three_op_sequence):
+        op_a, op_b, op_c = three_op_sequence
+        if not (
+            getOpCodeStr(op_a, self.model) == "CONV_2D"
+            and getOpCodeStr(op_b, self.model) == "CONV_2D"
+            and getOpCodeStr(op_c, self.model) == "MUL"
+        ):
+            return False
+
+        a_inputs = get_input_tensors(op_a, self.model)
+        b_inputs = get_input_tensors(op_b, self.model)
+        if len(a_inputs) < 2 or len(b_inputs) < 2:
+            return False
+        # both convs must share the same input tensor (StarBlock's x)
+        if a_inputs[0].tensor_idx != b_inputs[0].tensor_idx:
+            return False
+
+        a_out = get_output_tensors(op_a, self.model)
+        b_out = get_output_tensors(op_b, self.model)
+        if len(a_out) != 1 or len(b_out) != 1:
+            return False
+
+        mul_inputs = get_input_tensors(op_c, self.model)
+        if len(mul_inputs) != 2:
+            return False
+        mul_idxs = {mul_inputs[0].tensor_idx, mul_inputs[1].tensor_idx}
+        
+        return mul_idxs == {a_out[0].tensor_idx, b_out[0].tensor_idx}
 
     def _convert_PAD(self, op):
         # get input, weight, and output tensors

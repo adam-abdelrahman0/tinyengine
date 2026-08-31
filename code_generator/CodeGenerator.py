@@ -765,6 +765,27 @@ signed char* getOutput() {
 
                     layer_info["parsed_trainable"] = self.parse_count
                     self.parse_count += 1
+            elif layer_info["op"] == "STAR_FORWARD":
+                # fused StarBlock forward (act(f1(x)) * f2(x)): two
+                # independent conv branches folded into one op, so each
+                # gets its own weight/bias/scales slot -- generate_inference_str()
+                # references both via parsed_trainable_f1/_f2. multiplier/shift
+                # are precomputed by the parser (star_forward.py), same as
+                # conv2d.py's parser does for ordinary CONV_2D. See
+                # docs/star_forward_notes.md.
+                self._parseWeight(self.parse_count, layer_info["f1_weight_value"].flatten())
+                self._parseBias(self.parse_count, layer_info["f1_bias"].flatten())
+                self._parseEffectivescales(self.parse_count, layer_info["f1_effective_scale"].flatten())
+                self._parseRequantize(self.parse_count, layer_info["f1_shift"].flatten(), layer_info["f1_multiplier"].flatten())
+                layer_info["parsed_trainable_f1"] = self.parse_count
+                self.parse_count += 1
+
+                self._parseWeight(self.parse_count, layer_info["f2_weight_value"].flatten())
+                self._parseBias(self.parse_count, layer_info["f2_bias"].flatten())
+                self._parseEffectivescales(self.parse_count, layer_info["f2_effective_scale"].flatten())
+                self._parseRequantize(self.parse_count, layer_info["f2_shift"].flatten(), layer_info["f2_multiplier"].flatten())
+                layer_info["parsed_trainable_f2"] = self.parse_count
+                self.parse_count += 1
 
     def _parseCWHWeight(self, Lindex, weight, height, width, channel):
         fp = self.header_handle

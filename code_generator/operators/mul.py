@@ -21,8 +21,10 @@ default_params = {
     "weight_value": None,
     "bias": None,
     "input_zero_point": None,
+    "input2_zero_point": None,
     "output_zero_point": None,
     "input_scale": None,
+    "input2_scale": None,
     "output_scale": None,
     "multiplier": None,
     "shift": None,
@@ -155,6 +157,21 @@ class mul(basicOperator):
                         + f"{self._getBufferstrCast(params['input2_buf_add'], params['input2_buf_add_offset'])},"
                         + f"{self._getBufferstrCast(params['output_buf_add'], params['output_buf_add_offset'])});\n"
                     )
+        elif params["input_dtype"] == "int8":
+            # StarBlock's act(f1) * f2: both full tensors, same shape, no
+            # broadcast. Added for that case only, mirrors add.py's int8
+            # path (add_fpreq) but with a real requantized multiply kernel.
+            assert self.params["input_size"] == self.params["input2_size"], \
+                "int8 mul only supports same-shape elementwise multiply (StarBlock's f1 * f2), not broadcast"
+            string = (
+                f"mul_fpreq({self.params['output_size']},"
+                + f"{self._getBufferstr(params['input_buf_add'], params['input_buf_add_offset'])},"
+                + f"{self.params['input_scale']}f,{self.params['input_zero_point']}.0f,"
+                + f"{self._getBufferstr(params['input2_buf_add'], params['input2_buf_add_offset'])},"
+                + f"{self.params['input2_scale']}f,{self.params['input2_zero_point']}.0f,"
+                + f"{self.params['output_scale']}f,{self.params['output_zero_point']}.0f,"
+                + f"{self._getBufferstr(params['output_buf_add'], params['output_buf_add_offset'])});\n"
+            )
         else:
             raise NotImplementedError
 

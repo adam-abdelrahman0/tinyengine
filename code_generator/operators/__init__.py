@@ -23,4 +23,5 @@ __all__ = [
     "div",
     "strided_slice",
     "se_element_mult",
+    "star_forward",
 ]

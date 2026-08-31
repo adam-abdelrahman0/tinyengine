@@ -266,12 +266,17 @@ def isconstanttstr(str):
 
 
 def islabelstr(str):
-    if "label" in str:
-        return True
-    return False
+    # tflite-graph parsers pass integer tensor indices here, not the
+    # symbolic string names TTEParser.py builds, so a non-string index just
+    # means "not a label reference" instead of raising
+    try:
+        return "label" in str
+    except TypeError:
+        return False
 
 
 def isParamstr(str):
-    if "scale" in str or "weight" in str or "bias" in str:
-        return True
-    return False
+    try:
+        return "scale" in str or "weight" in str or "bias" in str
+    except TypeError:
+        return False

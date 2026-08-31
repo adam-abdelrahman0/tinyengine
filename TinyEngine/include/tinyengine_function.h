@@ -176,6 +176,20 @@ tinyengine_status element_mult_nx1(const q7_t *input, const uint16_t input_h, co
                                    const int32_t out_activation_min, const int32_t out_activation_max,
                                    const float output_scale, q7_t *output);
 
+// same-shape elementwise int8 multiply (StarBlock's act(f1) * f2), see mul_fpreq.c
+tinyengine_status mul_fpreq(int size, const int8_t *input1_data, const float input1_scale, const float input1_zero,
+                            const int8_t *input2_data, const float input2_scale, const float input2_zero,
+                            const float output_scale, const float zero_y, int8_t *output_data);
+
+// fused StarBlock forward: act(f1(x)) * f2(x) in one pass, see star_forward.c
+tinyengine_status star_forward(const q7_t *input, const uint16_t input_h, const uint16_t input_w,
+        const uint16_t input_ch, const int32_t input_offset,
+        const q7_t *w1, const int32_t *bias1, const float *scales1, const int32_t out_offset1,
+        const q7_t *w2, const int32_t *bias2, const float *scales2, const int32_t out_offset2,
+        const uint16_t mid_ch, const float x1_scale, const float x2_scale,
+        const float output_scale, const int32_t output_offset,
+        q7_t *output);
+
 #include "fp_requantize_op.h"
 #include "genInclude.h"
 //#include "int8_bp_op.h"
