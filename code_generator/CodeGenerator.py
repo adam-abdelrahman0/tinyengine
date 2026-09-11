@@ -914,11 +914,16 @@ signed char* getOutput() {
         fp.write(string)
         kernelsize = int(len(weight) / channel)
         # fuse the offset into bias
+        # tmpW/bias accumulate in plain Python ints (not numpy int8) so the
+        # intermediate sum doesn't overflow before int32_clip gets to clamp
+        # it -- numpy >=2.0's NEP 50 promotion keeps int8 dtype through the
+        # accumulation instead of widening it, so this used to silently
+        # (and correctly) widen on numpy 1.x and now raises OverflowError.
         for i in range(channel):
             tmpW = 0
             for j in range(kernelsize):
-                tmpW += weight[j * channel + i]
-            fp.write(str(self.int32_clip(bias[i] + tmpW * input_offset)) + ", ")
+                tmpW += int(weight[j * channel + i])
+            fp.write(str(self.int32_clip(int(bias[i]) + tmpW * input_offset)) + ", ")
         fp.write("};\n")
         string = f"{const_str}int32_t offsetRBias" + str(Lindex) + "[" + str(len(bias)) + "] = {"
         fp.write(string)
@@ -926,8 +931,8 @@ signed char* getOutput() {
         for i in range(channel):
             tmpW = 0
             for j in range(kernelsize):
-                tmpW += weight[j * channel + i]
-            fp.write(str(bias[i] + tmpW * input_offset - self.int32_clip(bias[i] + tmpW * input_offset)) + ", ")
+                tmpW += int(weight[j * channel + i])
+            fp.write(str(int(bias[i]) + tmpW * input_offset - self.int32_clip(int(bias[i]) + tmpW * input_offset)) + ", ")
         fp.write("};\n")
 
         if bias_name is not None:
@@ -974,7 +979,9 @@ signed char* getOutput() {
             return -(2**31)
         elif a > 2**31 - 1:
             return 2**31 - 1
-        return a.astype(int)
+        # a.astype(int) assumed a numpy scalar; callers now also pass plain
+        # Python ints (see _parseoffsetBias), so cast explicitly instead.
+        return int(a)
 
     def _closefp(self):
         self.header_handle.close()
