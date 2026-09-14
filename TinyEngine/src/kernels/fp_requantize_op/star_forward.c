@@ -90,7 +90,7 @@ tinyengine_status star_forward(const q7_t *input, const uint16_t input_h, const 
             /* elementwise combine, identical formula to mul_fpreq.c */
             float a_fp = ((float) s1 - (float) out_offset1) * x1_scale;
             float b_fp = ((float) s2 - (float) out_offset2) * x2_scale;
-            /* round(), not a truncating cast -- matches mul_fpreq.c exactly */
+            
             int32_t v = (int32_t) round((a_fp * b_fp) / output_scale + (float) output_offset);
             v = TN_MAX(v, -128);
             v = TN_MIN(v, 127);
