@@ -163,15 +163,30 @@ class mul(basicOperator):
             # path (add_fpreq) but with a real requantized multiply kernel.
             assert self.params["input_size"] == self.params["input2_size"], \
                 "int8 mul only supports same-shape elementwise multiply (StarBlock's f1 * f2), not broadcast"
-            string = (
-                f"mul_fpreq({self.params['output_size']},"
-                + f"{self._getBufferstr(params['input_buf_add'], params['input_buf_add_offset'])},"
-                + f"{self.params['input_scale']}f,{self.params['input_zero_point']}.0f,"
-                + f"{self._getBufferstr(params['input2_buf_add'], params['input2_buf_add_offset'])},"
-                + f"{self.params['input2_scale']}f,{self.params['input2_zero_point']}.0f,"
-                + f"{self.params['output_scale']}f,{self.params['output_zero_point']}.0f,"
-                + f"{self._getBufferstr(params['output_buf_add'], params['output_buf_add_offset'])});\n"
-            )
+            if str(self.params["input_idx"]) == str(self.params["input2_idx"]):
+                # Both operands are the identical graph tensor -- e.g.
+                # StarBlockV's self-gate act(f(x)) * x, when the quantizer/
+                # graph optimizer has collapsed the two operands to one
+                # shared tensor. GeneralMemoryScheduler.allocateMemory()
+                # aliases this op's output buffer onto its input for
+                # exactly this case, so it's safe to run in place -- no
+                # second SRAM buffer is needed for the multiply's output.
+                string = (
+                    f"mul_fpreq_inplace({self.params['output_size']},"
+                    + f"{self._getBufferstr(params['input_buf_add'], params['input_buf_add_offset'])},"
+                    + f"{self.params['input_scale']}f,{self.params['input_zero_point']}.0f,"
+                    + f"{self.params['output_scale']}f,{self.params['output_zero_point']}.0f);\n"
+                )
+            else:
+                string = (
+                    f"mul_fpreq({self.params['output_size']},"
+                    + f"{self._getBufferstr(params['input_buf_add'], params['input_buf_add_offset'])},"
+                    + f"{self.params['input_scale']}f,{self.params['input_zero_point']}.0f,"
+                    + f"{self._getBufferstr(params['input2_buf_add'], params['input2_buf_add_offset'])},"
+                    + f"{self.params['input2_scale']}f,{self.params['input2_zero_point']}.0f,"
+                    + f"{self.params['output_scale']}f,{self.params['output_zero_point']}.0f,"
+                    + f"{self._getBufferstr(params['output_buf_add'], params['output_buf_add_offset'])});\n"
+                )
         else:
             raise NotImplementedError
 

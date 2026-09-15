@@ -118,6 +118,26 @@ class GeneralMemoryScheduler:
                                     and isinstance(self.layer[following_idx].params["weight_value"], str)
                                 ):
                                     self.layer[following_idx].params["weight_value"] = op.input_tensors[0].graph_idx
+                if (
+                    op.params["op"] == "MUL"
+                    and op.params["input_dtype"] == "int8"
+                    and len(op.input_tensors) == 2
+                    and str(op.input_tensors[0].graph_idx) == str(op.input_tensors[1].graph_idx)
+                ):
+                    # StarBlockV's self-gate act(f(x)) * x, when the graph
+                    # optimizer has collapsed both operands to one shared
+                    # tensor (see mul.py's generate_inference_str() -- the
+                    # same input_idx == input2_idx check selects the
+                    # mul_fpreq_inplace kernel over mul_fpreq for this case).
+                    # Alias the output onto the input exactly like the
+                    # DEPTHWISE_CONV_2D case above, so no separate SRAM
+                    # buffer gets allocated for the multiply's output.
+                    previous_output_idx = op.output_tensors[0].graph_idx
+                    op.output_tensors[0].graph_idx = op.input_tensors[0].graph_idx
+                    for following_idx in range(i, len(self.layer)):
+                        for cnt, inp_tensor in enumerate(self.layer[following_idx].input_tensors):
+                            if str(inp_tensor.graph_idx) == str(previous_output_idx):
+                                inp_tensor.graph_idx = op.input_tensors[0].graph_idx
 
         num_layers = len(self.layer)
         # add all trainable tensors as one tensor

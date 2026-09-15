@@ -181,6 +181,11 @@ tinyengine_status mul_fpreq(int size, const int8_t *input1_data, const float inp
                             const int8_t *input2_data, const float input2_scale, const float input2_zero,
                             const float output_scale, const float zero_y, int8_t *output_data);
 
+// in-place variant for StarBlockV's self-gate act(f(x)) * x when both operands
+// are the identical graph tensor, see mul_fpreq_inplace.c
+tinyengine_status mul_fpreq_inplace(int size, int8_t *data, const float scale, const float zero,
+                                     const float output_scale, const float zero_y);
+
 // fused StarBlock forward: act(f1(x)) * f2(x) in one pass, see star_forward.c
 tinyengine_status star_forward(const q7_t *input, const uint16_t input_h, const uint16_t input_w,
         const uint16_t input_ch, const int32_t input_offset,
