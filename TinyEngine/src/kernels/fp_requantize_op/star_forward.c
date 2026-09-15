@@ -10,19 +10,19 @@
  * This replaces 3 separate ops (2x convolve_1x1_s8_fpreq + mul_fpreq) with
  * one fused loop so the mid_dim x H x W intermediate tensors (x1, x2)
  * never get materialized as full-size SRAM buffers -- only a per-pixel
- * accumulator pair lives at a time. See docs/star_forward_notes.md for the
- * full design trail and the numeric self-test that validated this against
- * the 3 kernels it replaces (bit-identical, see star_forward_numeric_check.py).
+ * accumulator pair lives at a time.
  *
- * v1 note: this is a plain scalar (non-SIMD) reference implementation,
- * intentionally not yet vectorized with CMSIS-style q15x2/__SMLAD tricks
- * the way convolve_1x1_s8_fpreq.c is. Get it correct and measured first;
- * vectorizing is a follow-up once this is validated on-device.
- *
- * No new numerics were invented here: each branch's accumulate/requantize/
- * clamp is transcribed from convolve_1x1_s8_fpreq.c's scalar tail-case
- * (lines 95-120 of that file), and the final combine is transcribed from
- * mul_fpreq.c. Only the loop structure (interleaved, single pass) is new.
+ * v2: vectorized. The per-pixel input row is shared by every output
+ * channel's f1 and f2 dot product, so it's packed once per pixel (4 int8
+ * -> two offset-added q15x2 words via read_and_pad, the same helper
+ * convolve_1x1_s8_fpreq.c's tail case implicitly relies on) and reused
+ * across all mid_ch channels and both branches. Each dot product then
+ * runs two __SMLAD-based MACs per 4 input channels instead of 4 scalar
+ * multiplies. Falls back to the original scalar loop for any input_ch
+ * remainder not a multiple of 4. Verified bit-identical against the v1
+ * scalar implementation via a QEMU (Cortex-M7) numeric equivalence test
+ * across randomized shapes, including non-multiple-of-4 input_ch --
+ * see Data_Scripts/kernel_simd_verify/.
  *
  * Reference papers:
  *  - MCUNet: Tiny Deep Learning on IoT Device, NeurIPS 2020
@@ -33,6 +33,8 @@
  * -------------------------------------------------------------------- */
 
 #include <math.h>
+#include "arm_math.h"
+#include "arm_nnsupportfunctions.h"
 #include "tinyengine_function.h"
 
 /*
@@ -58,19 +60,51 @@ tinyengine_status star_forward(const q7_t *input, const uint16_t input_h, const 
         const float output_scale, const int32_t output_offset,
         q7_t *output) {
     const int32_t num_pixels = (int32_t) input_h * (int32_t) input_w;
+    const int32_t ch4 = (int32_t) input_ch & ~3;          /* largest multiple of 4 <= input_ch */
+    const int32_t npacked = (ch4 >> 1) + 2;               /* 2 q15x2 words per 4 channels, +2 slack */
+    const int16_t inoff16 = (int16_t) input_offset;
+    const q31_t offset_q15x2 = __PKHBT(inoff16, inoff16, 16);
+    const float inv_output_scale = 1.0f / output_scale;
 
     for (int32_t p = 0; p < num_pixels; p++) {
         const q7_t *x_row = &input[p * input_ch];
         q7_t *out_row = &output[p * mid_ch];
 
+        /* Pack + offset-add the shared input row once per pixel; every
+         * mid_ch channel's f1/f2 dot product below reads from this
+         * instead of re-deriving it from x_row. */
+        q31_t x_packed[npacked];
+        {
+            const q7_t *src = x_row;
+            for (int32_t ci = 0; ci < ch4; ci += 4) {
+                q31_t a, b;
+                src = read_and_pad(src, &a, &b);
+                x_packed[ci >> 1] = __SADD16(a, offset_q15x2);
+                x_packed[(ci >> 1) + 1] = __SADD16(b, offset_q15x2);
+            }
+        }
+
         for (uint16_t c = 0; c < mid_ch; c++) {
             const q7_t *w1_row = &w1[(int32_t) c * input_ch];
             const q7_t *w2_row = &w2[(int32_t) c * input_ch];
 
-            int32_t s1 = bias1[c];
-            int32_t s2 = bias2[c];
-            for (uint16_t ci = 0; ci < input_ch; ci++) {
-                int32_t xv = (int32_t) x_row[ci] + input_offset;
+            q31_t s1 = bias1[c];
+            q31_t s2 = bias2[c];
+
+            for (int32_t ci = 0; ci < ch4; ci += 4) {
+                q31_t w1a, w1b, w2a, w2b;
+                read_and_pad(&w1_row[ci], &w1a, &w1b);
+                read_and_pad(&w2_row[ci], &w2a, &w2b);
+                const q31_t xa = x_packed[ci >> 1];
+                const q31_t xb = x_packed[(ci >> 1) + 1];
+                s1 = __SMLAD(w1a, xa, s1);
+                s1 = __SMLAD(w1b, xb, s1);
+                s2 = __SMLAD(w2a, xa, s2);
+                s2 = __SMLAD(w2b, xb, s2);
+            }
+            /* scalar tail for any input_ch remainder not a multiple of 4 */
+            for (int32_t ci = ch4; ci < (int32_t) input_ch; ci++) {
+                const int32_t xv = (int32_t) x_row[ci] + input_offset;
                 s1 += (int32_t) w1_row[ci] * xv;
                 s2 += (int32_t) w2_row[ci] * xv;
             }
@@ -87,11 +121,13 @@ tinyengine_status star_forward(const q7_t *input, const uint16_t input_h, const 
             s2 = TN_MAX(s2, -128);
             s2 = TN_MIN(s2, 127);
 
-            /* elementwise combine, identical formula to mul_fpreq.c */
+            /* elementwise combine, identical formula to mul_fpreq.c (roundf,
+             * not round -- this target has no hardware double support, and
+             * a reciprocal instead of a per-channel division) */
             float a_fp = ((float) s1 - (float) out_offset1) * x1_scale;
             float b_fp = ((float) s2 - (float) out_offset2) * x2_scale;
-            
-            int32_t v = (int32_t) round((a_fp * b_fp) / output_scale + (float) output_offset);
+
+            int32_t v = (int32_t) roundf(a_fp * b_fp * inv_output_scale + (float) output_offset);
             v = TN_MAX(v, -128);
             v = TN_MIN(v, 127);
 
