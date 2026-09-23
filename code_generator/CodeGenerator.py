@@ -60,8 +60,10 @@ class CodeGenerator:
         outputTables=None,
         detectionUtils=None,
         is_training=False,
+        fuse_selfgate=True,
     ):
         self.MemSche = memsche
+        self.fuse_selfgate = fuse_selfgate
 
         # Check if path exists, create it if not
         if not os.path.exists(include_path):
@@ -391,6 +393,8 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
         shift path) -- and the caller falls back to emitting both ops
         separately, unchanged.
         """
+        if not self.fuse_selfgate:
+            return None
         if i + 1 >= len(layers):
             return None
         conv_op, mul_op = layers[i], layers[i + 1]
