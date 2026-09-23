@@ -670,7 +670,17 @@ signed char* getOutput() {
                     )
                 else:
                     self._parseBias(self.parse_count, layer_info["bias"].flatten())
-                self._parseEffectivescales(self.parse_count, layer_info["effective_scale"].flatten())
+                # scalesN[] (float per-channel) is only ever read by the
+                # "_fpreq" kernel family (see convolve_1x1_s8_fpreq.c) --
+                # the standard int path (arm_nn_requantize + shift/
+                # multiplier, selected whenever self.fp_requantize is
+                # False, which is every current caller of this codegen)
+                # never touches it. Writing it unconditionally leaves a
+                # dead per-channel float array in flash for every conv
+                # layer -- confirmed on best_qat_mcu_model.pth: 50,560
+                # dead bytes across 79 layers, 0 references in genModel.c.
+                if self.fp_requantize:
+                    self._parseEffectivescales(self.parse_count, layer_info["effective_scale"].flatten())
                 self._parseRequantize(
                     self.parse_count,
                     layer_info["shift"].flatten(),
@@ -747,7 +757,8 @@ signed char* getOutput() {
                                 layer_info["weight_value"].flatten(),
                                 layer_info["input_c"],
                             )
-                        self._parseEffectivescales(self.parse_count, layer_info["effective_scale"].flatten())
+                        if self.fp_requantize:  # see the CONV_2D branch's comment above
+                            self._parseEffectivescales(self.parse_count, layer_info["effective_scale"].flatten())
                         self._parseRequantize(
                             self.parse_count,
                             layer_info["shift"].flatten(),
@@ -859,21 +870,24 @@ signed char* getOutput() {
                 # fused StarBlock forward (act(f1(x)) * f2(x)): two
                 # independent conv branches folded into one op, so each
                 # gets its own weight/bias/scales slot -- generate_inference_str()
-                # references both via parsed_trainable_f1/_f2. multiplier/shift
-                # are precomputed by the parser (star_forward.py), same as
-                # conv2d.py's parser does for ordinary CONV_2D. See
-                # docs/star_forward_notes.md.
+                # references both via parsed_trainable_f1/_f2. star_forward()'s
+                # C signature (see star_forward.c) only takes w/bias/scales per
+                # branch -- it has no shift/multiplier parameters at all, so
+                # f1_shift/f1_multiplier/f2_shift/f2_multiplier (still computed
+                # by the parser and available in layer_info, same as conv2d.py
+                # computes them for ordinary CONV_2D) are never read by the
+                # emitted call. Not writing them: confirmed dead in every
+                # star_forward-containing model this session has generated
+                # code for, 0 references in genModel.c.
                 self._parseWeight(self.parse_count, layer_info["f1_weight_value"].flatten())
                 self._parseBias(self.parse_count, layer_info["f1_bias"].flatten())
                 self._parseEffectivescales(self.parse_count, layer_info["f1_effective_scale"].flatten())
-                self._parseRequantize(self.parse_count, layer_info["f1_shift"].flatten(), layer_info["f1_multiplier"].flatten())
                 layer_info["parsed_trainable_f1"] = self.parse_count
                 self.parse_count += 1
 
                 self._parseWeight(self.parse_count, layer_info["f2_weight_value"].flatten())
                 self._parseBias(self.parse_count, layer_info["f2_bias"].flatten())
                 self._parseEffectivescales(self.parse_count, layer_info["f2_effective_scale"].flatten())
-                self._parseRequantize(self.parse_count, layer_info["f2_shift"].flatten(), layer_info["f2_multiplier"].flatten())
                 layer_info["parsed_trainable_f2"] = self.parse_count
                 self.parse_count += 1
 

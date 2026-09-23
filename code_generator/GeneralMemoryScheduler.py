@@ -42,8 +42,10 @@ class GeneralMemoryScheduler:
         VisaulizeTrainable=True,
         sort_by_lifetime=False,
         sort_by_start=False,
+        fp_requantize=False,
     ):
         self.layer = layer
+        self.fp_requantize = fp_requantize
         self.heads = 0
         self.buffers = {
             "input_output": 0,
@@ -263,7 +265,18 @@ class GeneralMemoryScheduler:
 
             layermem["MAC"] = op.get_macs()
             layermem["activation"] = op.get_activation_size()
-            layermem["scale"] = op.get_scale_size()
+            # get_scale_size() reports what a layer *could* need for the
+            # float-scales "_fpreq" kernel family -- CONV_2D/DEPTHWISE_CONV_2D
+            # only actually emit and reference that array when fp_requantize
+            # is on; otherwise CodeGenerator never writes it (see its
+            # _parseTrainable(), which mirrors this exact condition), so
+            # counting it here would overstate real flash. STAR_FORWARD
+            # always needs its scales regardless of this flag (its kernel has
+            # no int-multiplier/shift path at all).
+            if self.fp_requantize or op.params.get("op") == "STAR_FORWARD":
+                layermem["scale"] = op.get_scale_size()
+            else:
+                layermem["scale"] = 0
             layermem["runtime"] = op.get_sbuf_size()
             layermem["kernel"] = op.get_kbuf_size()
             self._enlargeBuffer("im2col", layermem["runtime"])
