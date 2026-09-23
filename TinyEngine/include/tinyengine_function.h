@@ -186,6 +186,16 @@ tinyengine_status mul_fpreq(int size, const int8_t *input1_data, const float inp
 tinyengine_status mul_fpreq_inplace(int size, int8_t *data, const float scale, const float zero,
                                      const float output_scale, const float zero_y);
 
+// fused 1x1 conv + StarBlockV self-gate square: relu6(conv(x))^2 in one
+// pass instead of conv-then-mul_fpreq_inplace, see convolve_1x1_s8_selfgate.c
+tinyengine_status convolve_1x1_s8_selfgate(
+    const q7_t *input, const uint16_t input_x, const uint16_t input_y, const uint16_t input_ch,
+    const q7_t *kernel, const int32_t *bias, const int32_t *output_shift, const int32_t *output_mult,
+    const int32_t out_offset, const int32_t input_offset, const int32_t out_activation_min,
+    const int32_t out_activation_max, q7_t *output, const uint16_t output_x, const uint16_t output_y,
+    const uint16_t output_ch, q15_t *runtime_buf, const float mul_scale, const float mul_zero,
+    const float mul_output_scale, const float mul_output_zero);
+
 // fused StarBlock forward: act(f1(x)) * f2(x) in one pass, see star_forward.c
 tinyengine_status star_forward(const q7_t *input, const uint16_t input_h, const uint16_t input_w,
         const uint16_t input_ch, const int32_t input_offset,

@@ -17,6 +17,7 @@
 # ----------------------------------------------------------------------
 
 import os
+import re
 
 from .constant import FUSE_SGD_UPDATE_STR, FUSHION_CONFIG
 from .OpGenerator import OpGenerator
@@ -28,6 +29,13 @@ source_path = Codegen_root + "Source/"
 use_hard_switsh = False
 gen_kernels = True
 use_aggressive_unroll = True
+
+# Matches the plain int-multiplier/shift 1x1 conv kernel family
+# (convolve_1x1_s8, _ch8, _ch16, _ch24, _ch48 -- all share the exact same
+# signature, just internally specialized per input_ch) -- NOT the
+# "_fpreq" float-scales family, which convolve_1x1_s8_selfgate() doesn't
+# support (see its docstring).
+_FUSABLE_CONV1X1_RE = re.compile(r"^(convolve_1x1_s8(?:_ch(?:8|16|24|48))?)\(")
 
 
 class CodeGenerator:
@@ -367,14 +375,73 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
             fp = self.source_handle
             fp.write(string)
 
+    def _tryFuseSelfGateConvMul(self, layers, i):
+        """Detect a 1x1 CONV_2D immediately followed by StarBlockV's
+        self-gate int8 MUL -- both MUL operands trace to the identical
+        tensor (see mul.py's generate_inference_str() int8 branch and
+        mul_fpreq_inplace.c), i.e. it's really relu6(conv(x))^2, not a
+        multiply against a second tensor. If it matches, return one call
+        to convolve_1x1_s8_selfgate() that fuses the conv and the square
+        into a single pass instead of two separate full passes over the
+        output buffer (conv writes, then mul_fpreq_inplace re-reads and
+        re-writes). Returns None if the pattern doesn't apply -- any
+        non-1x1 conv, a MUL that isn't the self-gate same-tensor case, or
+        a conv that resolved to the float-scales "_fpreq" kernel family
+        (convolve_1x1_s8_selfgate only implements the int-multiplier/
+        shift path) -- and the caller falls back to emitting both ops
+        separately, unchanged.
+        """
+        if i + 1 >= len(layers):
+            return None
+        conv_op, mul_op = layers[i], layers[i + 1]
+        cp, mp = conv_op.params, mul_op.params
+        if cp.get("op") != "CONV_2D" or cp.get("kernel_h") != 1 or cp.get("kernel_w") != 1:
+            return None
+        if mp.get("op") != "MUL" or mp.get("input_dtype") != "int8":
+            return None
+        if str(mp.get("input_idx")) != str(mp.get("input2_idx")):
+            return None  # two distinct tensors -- not the self-gate case
+        if str(mp.get("input_idx")) != str(cp.get("output_idx")):
+            return None  # this MUL doesn't consume this conv's output
+
+        conv_str = conv_op.generate_inference_str(
+            self.unsigned_input, False, use_aggressive_unroll, use_hard_switsh,
+            self.fp_requantize, self.tflite_op, self.dummy_address,
+        )
+        if "fpreq" in conv_str:
+            return None  # float-scales kernel family, not supported by the fused kernel
+
+        m = _FUSABLE_CONV1X1_RE.match(conv_str)
+        if not m:
+            return None  # unexpected kernel selection (e.g. a patch-based variant) -- don't guess
+
+        extra_args = (
+            f",{mp['input_scale']}f,{mp['input_zero_point']}.0f,"
+            f"{mp['output_scale']}f,{mp['output_zero_point']}.0f"
+        )
+        fused_str = _FUSABLE_CONV1X1_RE.sub("convolve_1x1_s8_selfgate(", conv_str, count=1).rstrip()
+        assert fused_str.endswith(");"), f"unexpected conv call format, can't fuse safely: {fused_str!r}"
+        return fused_str[:-2] + extra_args + ");\n"
+
     def _genInvoke(self):
         fp = self.source_handle
         string = "void invoke(float* labels){\n"
         fp.write(string)
 
         schedule = self.MemSche
-        for i, op in enumerate(schedule.layer):
+        i = 0
+        n = len(schedule.layer)
+        while i < n:
+            op = schedule.layer[i]
             layer_info = op.get_layer_info()
+
+            fused_str = self._tryFuseSelfGateConvMul(schedule.layer, i)
+            if fused_str is not None:
+                fp.write("/* layer " + str(i) + ":CONV_2D+MUL fused (self-gate relu6(conv(x))^2) */\n")
+                fp.write(fused_str)
+                i += 2
+                continue
+
             string = "/* layer " + str(i) + ":" + layer_info["op"] + " */\n"
             fp.write(string)
 
@@ -412,6 +479,8 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
                 string = self._genOpstr(op)
                 fp.write(string)
 
+            i += 1
+
         string = "}\n"
         fp.write(string)
 
@@ -421,8 +490,23 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
         fp.write(string)
 
         schedule = self.MemSche
-        for i, op in enumerate(schedule.layer):
+        i = 0
+        n = len(schedule.layer)
+        while i < n:
+            op = schedule.layer[i]
             layer_info = op.get_layer_info()
+
+            # Self-gate convs never land on the output_c==2/10 classifier-head
+            # early-return below (mid_ch is always a real stage width, e.g.
+            # 96/192/384/672 for this net) -- fusing first and letting that
+            # check apply only to the normal per-op path is safe.
+            fused_str = self._tryFuseSelfGateConvMul(schedule.layer, i)
+            if fused_str is not None:
+                fp.write("/* layer " + str(i) + ":CONV_2D+MUL fused (self-gate relu6(conv(x))^2) */\n")
+                fp.write(fused_str)
+                i += 2
+                continue
+
             string = "/* layer " + str(i) + ":" + layer_info["op"] + " */\n"
             fp.write(string)
 
@@ -463,6 +547,8 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
             else:
                 string = self._genOpstr(op)
                 fp.write(string)
+
+            i += 1
 
         string = "}\n"
         fp.write(string)
