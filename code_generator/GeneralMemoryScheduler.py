@@ -41,6 +41,7 @@ class GeneralMemoryScheduler:
         mem_visual_path="codegen/allocation.png",
         VisaulizeTrainable=True,
         sort_by_lifetime=False,
+        sort_by_start=False,
     ):
         self.layer = layer
         self.heads = 0
@@ -58,7 +59,7 @@ class GeneralMemoryScheduler:
         self.bias = 0
         self.scale = 0
         self.code = 0
-        self.allocator = FirstFit(memory_limit, sort_by_lifetime)
+        self.allocator = FirstFit(memory_limit, sort_by_lifetime, sort_by_start)
         self.outputTables = outputTables
         self.USE_INPLACE = inplace
         self.mem_visual_path = mem_visual_path

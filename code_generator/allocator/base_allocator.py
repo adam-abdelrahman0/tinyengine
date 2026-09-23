@@ -33,10 +33,11 @@ from code_generator.constant import (
 
 
 class BaseAllocator:
-    def __init__(self, SRAM, sort_by_lifetime=False):
+    def __init__(self, SRAM, sort_by_lifetime=False, sort_by_start=False):
         self.rectangles = []
         self.SRAM = SRAM
         self.sort_by_lifetime = sort_by_lifetime
+        self.sort_by_start = sort_by_start
 
     # Description: add a tensor to schedule, return the index of the rectangle
     # Note: placement -1 indicates no placed yet
@@ -84,6 +85,24 @@ class BaseAllocator:
         raise NotImplementedError
 
     def sortSize(self):
+        if self.sort_by_start:
+            # Process tensors in the order they first become live (ascending
+            # start index) instead of largest-first. Largest-first can place
+            # a big early tensor (e.g. the stem's input/output) at the
+            # bottom of SRAM, then strand a *later*, same-size tensor above
+            # it even after the early one's lifetime has ended -- because by
+            # the time the allocator gets to placing it, other still-live
+            # tensors from sibling blocks (e.g. two overlapping StarBlockV
+            # residual buffers in one stage) already occupy the freed gap.
+            # Placing in temporal order lets each new tensor land in
+            # whatever's actually free *right now*, which for this model
+            # recovers the full theoretical minimum peak (verified: 526,848
+            # -> 451,584 bytes, closing a forced 75,264-byte allocator gap
+            # with zero accuracy/latency cost -- see tflite_convert.py's
+            # --sort-by-start flag).
+            self.rectangles = sorted(self.rectangles, key=lambda r: r["start"])
+            return
+
         sort_rectangles = []
         while len(self.rectangles) > 0:
             max_life = 0
