@@ -78,12 +78,38 @@ class GeneralMemoryScheduler:
                 return True
         return False
 
+    def _hasOtherConsumer(self, graph_idx, excluding_op):
+        """True if some op other than `excluding_op` also reads a tensor with
+        this graph_idx -- e.g. a residual/skip ADD further downstream that
+        needs this exact value, not just the op immediately consuming it.
+        The in-place DEPTHWISE_CONV_2D aliasing below computes its output by
+        overwriting its input's own buffer (a real in-place C kernel call,
+        not just an address-sharing bookkeeping trick) -- safe only when
+        nothing else still needs that original value. Confirmed via a real
+        on-device/QEMU logit mismatch tracing back to exactly this: a
+        depthwise conv's in-place output silently destroyed a tensor a
+        later residual ADD still needed, with no error at codegen or build
+        time since the scheduler never checked for this second consumer.
+        """
+        for other in self.layer:
+            if other is excluding_op:
+                continue
+            for inp in other.input_tensors:
+                if str(inp.graph_idx) == str(graph_idx):
+                    return True
+        return False
+
     def allocateMemory(self):
         # assign the same graph index for inplace operations
         # note: we need to handle stride == 2 for int8 depthwise to save memory
         if self.USE_INPLACE:
             for i, op in enumerate(self.layer):
-                if op.params["op"] == "DEPTHWISE_CONV_2D" and op.params["input_dtype"] == "int8" and not self.tflite_op:
+                if (
+                    op.params["op"] == "DEPTHWISE_CONV_2D"
+                    and op.params["input_dtype"] == "int8"
+                    and not self.tflite_op
+                    and not self._hasOtherConsumer(op.input_tensors[0].graph_idx, op)
+                ):
                     # set the idx of output and next layer input
                     previous_output_idx = op.output_tensors[0].graph_idx
                     op.output_tensors[0].graph_idx = op.input_tensors[0].graph_idx
