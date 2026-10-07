@@ -45,6 +45,14 @@ class sigmoid(basicOperator):
                 + f"{self._getBufferstrCast(params['input_buf_add'], params['input_buf_add_offset'])},"
                 + f"{self._getBufferstrCast(params['output_buf_add'], params['output_buf_add_offset'])});\n"
             )
+        elif params["input_dtype"] == "int8":
+            string = (
+                f"tte_sigmoid_fpreq({self.params['input_size']},"
+                + f"{self._getBufferstr(params['input_buf_add'], params['input_buf_add_offset'])},"
+                + f"{self.params['input_scale']}f,{self.params['input_zero_point']}.0f,"
+                + f"{self.params['output_scale']}f,{self.params['output_zero_point']}.0f,"
+                + f"{self._getBufferstr(params['output_buf_add'], params['output_buf_add_offset'])});\n"
+            )
         else:
             raise NotImplementedError
         return string

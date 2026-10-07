@@ -23,7 +23,6 @@ def parse_fc(op, model: Model.Model):
     weight_tensor = input_tensors[1]
     bias_tensor = input_tensors[2]
     weight = get_np_from_wrapper(weight_tensor)
-    bias = get_np_from_wrapper(bias_tensor)
 
     output_tensors = get_output_tensors(op, model)
     assert len(output_tensors) == 1, "output tensors length should be 1"
@@ -40,6 +39,14 @@ def parse_fc(op, model: Model.Model):
     input_type = getTensorTypeStr(input_tensor.tensor.Type())
     output_type = getTensorTypeStr(output_tensor.tensor.Type())
     assert input_type == output_type, "tensor type not consistent"
+
+    if bias_tensor is not None:
+        bias = get_np_from_wrapper(bias_tensor)
+    else:
+        # bias is optional in tflite's FULLY_CONNECTED (e.g. a bias-free
+        # nn.Linear, as in a squeeze-excite gate) -- synthesize a zero bias
+        # so downstream CONV_2D codegen still gets a real bias array.
+        bias = np.zeros(output_c, dtype=np.float32 if input_type == "float32" else np.int32)
 
     # initialize quantized parameters as None for floating-pointer ops
     input_zero_point = None
@@ -58,7 +65,10 @@ def parse_fc(op, model: Model.Model):
         output_zero_point = output_tensor.qnn_params["zero_point"]
         input_scale = input_tensor.qnn_params["scale"]
         weight_scale = weight_tensor.qnn_params["scale"]
-        bias_scale = bias_tensor.qnn_params["scale"]
+        # a synthesized zero bias has no real tensor/qparams to read a scale
+        # from; any scale works numerically since the bias itself is zero,
+        # so reuse weight_scale (same shape convention as a real bias_scale).
+        bias_scale = bias_tensor.qnn_params["scale"] if bias_tensor is not None else weight_scale
         output_scale = output_tensor.qnn_params["scale"]
 
         # We support per channel in the CONV2D operator

@@ -63,6 +63,15 @@ def _get_wrapper_tensors(tensor_index_list, model: Model.Model):
     ret = []
     subgraph = model.Subgraphs(0)
     for idx in tensor_index_list:
+        if idx == -1:
+            # tflite's own convention for an absent optional input (e.g. a
+            # FULLY_CONNECTED op whose source Linear/MatMul had no bias) --
+            # subgraph.Tensors(-1) would read a garbage flatbuffer offset
+            # instead of raising, so it must be caught here rather than
+            # dereferenced. Callers that can have an optional input (see
+            # fc.py's parse_fc) must handle a None entry.
+            ret.append(None)
+            continue
         tensor = subgraph.Tensors(idx)
         buffer_idx = tensor.Buffer()
         buffer = model.Buffers(buffer_idx)

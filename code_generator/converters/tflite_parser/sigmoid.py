@@ -32,4 +32,10 @@ def parse_logistic(op, model: Model.Model):
         "output_dtype": output_type,
     }
 
+    if input_type != "float32":
+        params["input_zero_point"] = input_tensor.qnn_params["zero_point"]
+        params["input_scale"] = input_tensor.qnn_params["scale"]
+        params["output_zero_point"] = output_tensor.qnn_params["zero_point"]
+        params["output_scale"] = output_tensor.qnn_params["scale"]
+
     return sigmoid.sigmoid(params)
