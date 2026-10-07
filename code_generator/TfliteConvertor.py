@@ -157,6 +157,8 @@ class TfliteConvertor(object):
             # SE-block MUL->MUL sequence is
             # intercepted earlier in parseOperatorInfo() and never reaches here
             self.layer.append(TF_Parser.parse_mul(op, self.model))
+        elif op_code_str == "LOGISTIC":
+            self.layer.append(TF_Parser.parse_logistic(op, self.model))
         elif op_code_str in SKIP_OPs:
             pass
         else:

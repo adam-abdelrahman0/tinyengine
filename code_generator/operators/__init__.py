@@ -14,6 +14,7 @@ __all__ = [
     "mul",
     "sum",
     "exp",
+    "sigmoid",
     "sub",
     "zeros_like",
     "where",

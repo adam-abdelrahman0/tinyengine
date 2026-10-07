@@ -5,6 +5,7 @@ from .fc import parse_fc
 from .maxpool import parse_maxpool
 from .mean1dto2d import parse_mead1dto2d
 from .mul import parse_mul
+from .sigmoid import parse_logistic
 from .star_forward import parse_star_forward
 from .SEelement import parse_SEelement
 from .upsample import parse_upsample

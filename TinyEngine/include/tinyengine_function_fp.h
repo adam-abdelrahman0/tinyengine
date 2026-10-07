@@ -74,6 +74,8 @@ tinyengine_status_fp sum_4D_exclude(const float* input_data, const uint16_t d1, 
 
 tinyengine_status_fp tte_exp(const uint16_t size, const float* input_data, float* output_data);
 
+tinyengine_status_fp tte_sigmoid(const uint16_t size, const float* input_data, float* output_data);
+
 tinyengine_status_fp where(const bool* inMask, const uint16_t size, const float* input1_data,
 		const float* input2_data, float* output_data);
 
