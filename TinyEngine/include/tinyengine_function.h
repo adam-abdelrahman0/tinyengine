@@ -186,6 +186,20 @@ tinyengine_status mul_fpreq(int size, const int8_t *input1_data, const float inp
 tinyengine_status mul_fpreq_inplace(int size, int8_t *data, const float scale, const float zero,
                                      const float output_scale, const float zero_y);
 
+// broadcast elementwise int8 multiply: a full HxWxC tensor times a per-channel
+// C-length vector reused across every spatial position (e.g. a squeeze-excite
+// gate's sigmoid output scaling its own input) -- same dequant/requant math as
+// mul_fpreq, see mul_fpreq_broadcast.c
+tinyengine_status mul_fpreq_broadcast(int size, const int8_t *input_data, const float input_scale,
+                                       const float input_zero, const int8_t *scaler_data, int scaler_size,
+                                       const float scaler_scale, const float scaler_zero, const float output_scale,
+                                       const float zero_y, int8_t *output_data);
+
+// int8 sigmoid, float-dequantized/requantized (squeeze-excite gate), see tte_sigmoid_fpreq.c
+tinyengine_status tte_sigmoid_fpreq(int size, const int8_t *input_data, const float input_scale,
+                                     const float input_zero, const float output_scale, const float zero_y,
+                                     int8_t *output_data);
+
 // fused 1x1 conv + StarBlockV self-gate square: relu6(conv(x))^2 in one
 // pass instead of conv-then-mul_fpreq_inplace, see convolve_1x1_s8_selfgate.c
 tinyengine_status convolve_1x1_s8_selfgate(

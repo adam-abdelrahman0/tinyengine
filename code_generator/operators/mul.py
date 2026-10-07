@@ -45,7 +45,7 @@ class mul(basicOperator):
         # handle input/output tensors in HWC format
         self._add_input(self.params["input_idx"], self.params["input_dtype"], self.params["input_size"], 1, 1)
         if not (isParamstr(self.params["input2_idx"]) or islabelstr(self.params["input2_idx"])):
-            self._add_input(self.params["input2_idx"], self.params["input2_dtype"], self.params["output_size"], 1, 1)
+            self._add_input(self.params["input2_idx"], self.params["input2_dtype"], self.params["input2_size"], 1, 1)
         self._add_output(self.params["output_idx"], self.params["output_dtype"], self.params["output_size"], 1, 1)
 
         if None in default_params:
@@ -53,7 +53,7 @@ class mul(basicOperator):
 
     def get_macs(self):
         p = self.params
-        return p["input_size"]
+        return max(p["input_size"], p["input2_size"])
 
     def generate_inference_str(self):
         params = self.params
@@ -158,12 +158,35 @@ class mul(basicOperator):
                         + f"{self._getBufferstrCast(params['output_buf_add'], params['output_buf_add_offset'])});\n"
                     )
         elif params["input_dtype"] == "int8":
-            # StarBlock's act(f1) * f2: both full tensors, same shape, no
-            # broadcast. Added for that case only, mirrors add.py's int8
-            # path (add_fpreq) but with a real requantized multiply kernel.
-            assert self.params["input_size"] == self.params["input2_size"], \
-                "int8 mul only supports same-shape elementwise multiply (StarBlock's f1 * f2), not broadcast"
-            if str(self.params["input_idx"]) == str(self.params["input2_idx"]):
+            # StarBlock's act(f1) * f2 (both full tensors, same shape) mirrors
+            # add.py's int8 path (add_fpreq) but with a real requantized
+            # multiply kernel. A squeeze-excite gate's per-channel scale
+            # vector multiplied across the full feature map (e.g.
+            # [1,14,14,128] * [1,128]) hits the broadcast branch below instead,
+            # mirroring the float32 path's HW_cout loop above but through
+            # mul_fpreq_broadcast()'s dequant/requant math.
+            if self.params["input_size"] != self.params["input2_size"]:
+                if self.params["input_size"] > self.params["input2_size"]:
+                    array_buf = self._getBufferstr(params["input_buf_add"], params["input_buf_add_offset"])
+                    array_scale, array_zp = self.params["input_scale"], self.params["input_zero_point"]
+                    scaler_buf = self._getBufferstr(params["input2_buf_add"], params["input2_buf_add_offset"])
+                    scaler_scale, scaler_zp = self.params["input2_scale"], self.params["input2_zero_point"]
+                    scaler_size = self.params["input2_size"]
+                else:
+                    array_buf = self._getBufferstr(params["input2_buf_add"], params["input2_buf_add_offset"])
+                    array_scale, array_zp = self.params["input2_scale"], self.params["input2_zero_point"]
+                    scaler_buf = self._getBufferstr(params["input_buf_add"], params["input_buf_add_offset"])
+                    scaler_scale, scaler_zp = self.params["input_scale"], self.params["input_zero_point"]
+                    scaler_size = self.params["input_size"]
+
+                string = (
+                    f"mul_fpreq_broadcast({self.params['output_size']},"
+                    + f"{array_buf},{array_scale}f,{array_zp}.0f,"
+                    + f"{scaler_buf},{scaler_size},{scaler_scale}f,{scaler_zp}.0f,"
+                    + f"{self.params['output_scale']}f,{self.params['output_zero_point']}.0f,"
+                    + f"{self._getBufferstr(params['output_buf_add'], params['output_buf_add_offset'])});\n"
+                )
+            elif str(self.params["input_idx"]) == str(self.params["input2_idx"]):
                 # Both operands are the identical graph tensor -- e.g.
                 # StarBlockV's self-gate act(f(x)) * x, when the quantizer/
                 # graph optimizer has collapsed the two operands to one
