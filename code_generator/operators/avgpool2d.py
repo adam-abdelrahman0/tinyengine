@@ -47,6 +47,14 @@ default_params = {
     "kernel_w": None,
     "input_dtype": "int8",
     "output_dtype": "int8",
+    # Optional: only set when the caller knows input/output quantization may
+    # differ (see mean1dto2d.py). None when unknown/not applicable -- the
+    # plain integer avg_pooling kernel is used as-is in that case, matching
+    # prior behavior.
+    "input_scale": None,
+    "input_zero_point": None,
+    "output_scale": None,
+    "output_zero_point": None,
 }
 
 
@@ -76,13 +84,36 @@ class AvgPool2d(basicOperator):
 
     def generate_inference_str(self):
         params = self.params
+        output_buf = self._getBufferstr(params["output_buf_add"], params["output_buf_add_offset"])
         string = (
             f"avg_pooling({self._getBufferstr(params['input_buf_add'], params['input_buf_add_offset'])},"
             + f"{str(params['input_h'])},{str(params['input_w'])},{str(params['input_c'])},{str(params['filter_h'])},"
         )
-        string += (
-            f"{str(params['filter_w'])},1,1,-128,127,"
-            f"{self._getBufferstr(params['output_buf_add'], params['output_buf_add_offset'])});\n"
-        )
+        string += f"{str(params['filter_w'])},1,1,-128,127,{output_buf});\n"
+
+        # avg_pooling() has no rescale path -- it just integer-averages,
+        # implicitly assuming input and output share one quantization. When
+        # they don't (confirmed on a real model: TFLite gave this MEAN
+        # different input/output scales), rescale the result in place:
+        # dequantize by the input scale, requantize by the output scale.
+        in_scale = params.get("input_scale")
+        out_scale = params.get("output_scale")
+        if in_scale is not None and out_scale is not None and abs(in_scale - out_scale) > 1e-12:
+            in_zero = params.get("input_zero_point") or 0
+            out_zero = params.get("output_zero_point") or 0
+            n = params["output_h"] * params["output_w"] * params["output_c"]
+            rescale = float(in_scale) / float(out_scale)
+            string += (
+                f"{{\n"
+                f"q7_t *_rq_out = {output_buf};\n"
+                f"for (int _rq_i = 0; _rq_i < {n}; _rq_i++) {{\n"
+                f"    float _rq_f = (float)(_rq_out[_rq_i] - ({in_zero})) * {rescale}f;\n"
+                f"    int _rq_v = (int)(_rq_f >= 0.0f ? _rq_f + 0.5f : _rq_f - 0.5f) + ({out_zero});\n"
+                f"    if (_rq_v < -128) _rq_v = -128;\n"
+                f"    if (_rq_v > 127) _rq_v = 127;\n"
+                f"    _rq_out[_rq_i] = (q7_t)_rq_v;\n"
+                f"}}\n"
+                f"}}\n"
+            )
 
         return string

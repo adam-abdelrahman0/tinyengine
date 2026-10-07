@@ -34,14 +34,25 @@
 
 tinyengine_status mul_fpreq_inplace(int size, int8_t* data, const float scale, const float zero,
 			const float output_scale, const float zero_y) {
-  for (int i = 0; i < size; ++i) {
-	  float val = ((float)data[i] - zero) * scale;
+  const float inv_output_scale = 1.0f / output_scale;
+  int i = 0;
 
-    int clamped_output = (int)round((val * val) / output_scale + zero_y);
-    clamped_output = TN_MAX(clamped_output, -128);
-    clamped_output = TN_MIN(clamped_output, 127);
+  for (; i + 1 < size; i += 2) {
+    const float v0 = ((float) data[i]     - zero) * scale;
+    const float v1 = ((float) data[i + 1] - zero) * scale;
 
-    data[i] = (int8_t)(clamped_output);
+    int32_t o0 = (int32_t) roundf(v0 * v0 * inv_output_scale + zero_y);
+    int32_t o1 = (int32_t) roundf(v1 * v1 * inv_output_scale + zero_y);
+    o0 = TN_MAX(o0, -128); o0 = TN_MIN(o0, 127);
+    o1 = TN_MAX(o1, -128); o1 = TN_MIN(o1, 127);
+    data[i] = (int8_t) o0;
+    data[i + 1] = (int8_t) o1;
+  }
+  for (; i < size; i++) {
+    const float v = ((float) data[i] - zero) * scale;
+    int32_t o = (int32_t) roundf(v * v * inv_output_scale + zero_y);
+    o = TN_MAX(o, -128); o = TN_MIN(o, 127);
+    data[i] = (int8_t) o;
   }
   return STATE_SUCCESS;
 }

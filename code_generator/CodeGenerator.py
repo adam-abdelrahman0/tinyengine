@@ -20,6 +20,7 @@ import os
 import re
 
 from .constant import FUSE_SGD_UPDATE_STR, FUSHION_CONFIG
+from .GeneralMemoryScheduler import _base_graph_idx
 from .OpGenerator import OpGenerator
 
 Codegen_root = "./codegen/"
@@ -36,6 +37,22 @@ use_aggressive_unroll = True
 # "_fpreq" float-scales family, which convolve_1x1_s8_selfgate() doesn't
 # support (see its docstring).
 _FUSABLE_CONV1X1_RE = re.compile(r"^(convolve_1x1_s8(?:_ch(?:8|16|24|48))?)\(")
+
+
+def _resolve_output_hw(layers, idx):
+    """output_h/output_w of layers[idx]. Shape-preserving elementwise ops
+    (MUL -- StarBlockV's self-gate squaring, see mul.py's default_params)
+    never store these, only a flat element count, since the op's own math
+    doesn't need the 2-D shape. Walk backward to the nearest op that does
+    carry it -- correct here because such ops don't change the spatial
+    shape. Confirmed via a real crash: with patch_split_index landing right
+    on a self-gate MUL, last_patch_op.params["output_w"] raised
+    KeyError('output_w')."""
+    for i in range(idx, -1, -1):
+        info = layers[i].get_layer_info()
+        if info.get("output_h") is not None:
+            return info["output_h"], info["output_w"]
+    raise ValueError(f"could not resolve output H/W at or before layer {idx}")
 
 
 class CodeGenerator:
@@ -195,6 +212,38 @@ void update_SGD(float learning_rate){\n"""
             first_bufferstr_for_normal_inference = first_normal_op._getBufferstr(
                 first_normal_op.params["input_buf_add"], first_normal_op.params["input_buf_add_offset"]
             )
+
+            # The patch-boundary tensor (first_normal_op's input) may have OTHER
+            # consumers besides first_normal_op -- e.g. a residual ADD several
+            # layers later in invoke() that reads the same logical tensor from a
+            # DIFFERENT scheduler-assigned address. The reassembly loop below only
+            # ever wrote to first_bufferstr_for_normal_inference, so any such
+            # other address was left with stale per-patch scratch data. Find all
+            # distinct extra addresses and write the reassembled result there too.
+            # Match GeneralMemoryScheduler._hasOtherConsumer's own suffix handling:
+            # the patch-boundary tensor's graph_idx is renamed with this suffix
+            # (see InputResizer.py), but a downstream consumer (e.g. a residual
+            # ADD) may still reference the original, un-suffixed value.
+            target_graph_idx = _base_graph_idx(first_normal_op.input_tensors[0].graph_idx)
+            seen_bufs = {first_bufferstr_for_normal_inference}
+            extra_output_bufs = []
+            for op in schedule.layer:
+                if op is first_normal_op or op is last_patch_op:
+                    continue
+                other_layer_info = op.get_layer_info()
+                if other_layer_info.get("is_patch"):
+                    continue
+                for k, t in enumerate(op.input_tensors):
+                    if _base_graph_idx(t.graph_idx) != target_graph_idx:
+                        continue
+                    buf_key = "input_buf_add" if k == 0 else f"input{k + 1}_buf_add"
+                    if buf_key not in op.params:
+                        continue
+                    buf_str = op._getBufferstr(op.params[buf_key], op.params[buf_key + "_offset"])
+                    if buf_str not in seen_bufs:
+                        seen_bufs.add(buf_str)
+                        extra_output_bufs.append(buf_str)
+
             assert last_patch_op
             fp = self.source_handle
             string = ""
@@ -205,10 +254,8 @@ void update_SGD(float learning_rate){\n"""
             ]
             # by default, we go three stride 2 conv in the patch-based inference
             # patch_out_w = int((first_width - self.patch_params["pad_l"]) / 8)
-            patch_out_w = last_patch_op.params["output_w"]
-            # by default, we go three stride 2 conv in the patch-based inference
-            # patch_out_h = int((first_height - self.patch_params["pad_l"]) / 8)
-            patch_out_h = last_patch_op.params["output_h"]
+            last_patch_idx = schedule.layer.index(last_patch_op)
+            patch_out_h, patch_out_w = _resolve_output_hw(schedule.layer, last_patch_idx)
             out_w = self.patch_params["output_w"]
             # output_idx for data movement
             output_idx_str = (
@@ -296,7 +343,12 @@ void update_SGD(float learning_rate){\n"""
             q7_t* patch_output = """
                 + f"{last_patch_op_output_buffer_str_for_patch_inference}"
                 + """;
-            for (h = 0; h < """
+"""
+                + "".join(
+                    f"            q7_t* output_ptr_extra{n} = {buf_str};\n"
+                    for n, buf_str in enumerate(extra_output_bufs)
+                )
+                + """            for (h = 0; h < """
                 + str(patch_out_h)
                 + """; h++){
                 for (w = 0; w < """
@@ -313,7 +365,16 @@ void update_SGD(float learning_rate){\n"""
                 + """) * """
                 + str(self.patch_params["output_c"])
                 + """ + c];
-                    }
+"""
+                + "".join(
+                    f"                        output_ptr_extra{n}[output_idx] = patch_output[(w + h * "
+                    + str(patch_out_w)
+                    + ") * "
+                    + str(self.patch_params["output_c"])
+                    + " + c];\n"
+                    for n in range(len(extra_output_bufs))
+                )
+                + """                    }
                 }
             }
         }

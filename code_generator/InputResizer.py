@@ -171,8 +171,22 @@ class PatchResizer:
         # 2. set the lifetime of the input tensor of the first layer in the second stage to start from begging
         # so the memory buffers can be allocated successfully
         if PatchLayers > 0:
-            self.layer[PatchLayers].params["input_idx"] = (
-                str(self.layer[PatchLayers].params["input_idx"]) + "_start_normal_infernece_block"
-            )
-            self.layer[PatchLayers].input_tensors[0].graph_idx = self.layer[PatchLayers].params["input_idx"]
+            original_idx = str(self.layer[PatchLayers].params["input_idx"])
+            renamed_idx = original_idx + "_start_normal_infernece_block"
+            self.layer[PatchLayers].params["input_idx"] = renamed_idx
+            self.layer[PatchLayers].input_tensors[0].graph_idx = renamed_idx
             self.layer[PatchLayers].params["is_start_of_normal_inference_block"] = True
+
+            # Any OTHER normal-side op consuming this same patch-boundary value
+            # (e.g. a residual ADD several layers later, referencing it by the
+            # original un-suffixed id) must be renamed too -- otherwise the
+            # scheduler's tensor-identity bookkeeping (keyed on this exact
+            # string) treats it as a DIFFERENT, un-"cut-off" tensor than the one
+            # renamed above, and may alias it with last_patch_op's own (still
+            # bare-"original_idx"-named) per-patch scratch output instead of
+            # the big reassembled tensor -- confirmed via a QEMU run where the
+            # residual ADD ended up reading stale per-patch scratch data.
+            for other in self.layer[PatchLayers + 1 :]:
+                for t in other.input_tensors:
+                    if str(t.graph_idx) == original_idx:
+                        t.graph_idx = renamed_idx

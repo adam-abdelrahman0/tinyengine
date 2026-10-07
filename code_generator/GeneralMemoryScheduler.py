@@ -29,6 +29,23 @@ from .constant import (
 )
 
 
+# Patch-based inference (InputResizer.py) renames the graph_idx of the tensor
+# crossing the patch/normal-inference boundary by appending this suffix, to
+# decouple its lifetime tracking from the patch loop's own hand-written C
+# code (which this scheduler can't see into -- there's no real op "producing"
+# that tensor for it to anchor a lifetime on). The renamed tensor and its
+# original-numbered self are still the same logical value, so any code
+# comparing graph_idx strings for tensor identity must strip this suffix
+# first, or a downstream consumer referencing the original (un-suffixed)
+# graph_idx will silently fail to match.
+PATCH_BOUNDARY_SUFFIX = "_start_normal_infernece_block"
+
+
+def _base_graph_idx(idx):
+    idx = str(idx)
+    return idx[: -len(PATCH_BOUNDARY_SUFFIX)] if idx.endswith(PATCH_BOUNDARY_SUFFIX) else idx
+
+
 class GeneralMemoryScheduler:
     def __init__(
         self,
@@ -90,12 +107,22 @@ class GeneralMemoryScheduler:
         depthwise conv's in-place output silently destroyed a tensor a
         later residual ADD still needed, with no error at codegen or build
         time since the scheduler never checked for this second consumer.
+        Patch-based inference (InputResizer.py) renames the graph_idx of a
+        tensor crossing the patch/normal-inference boundary by appending
+        "_start_normal_infernece_block" (to decouple its lifetime tracking
+        from the patch loop's own hand-written C code, which the scheduler
+        can't see into). That rename must not defeat this check: the renamed
+        tensor and its original-numbered self are still the same logical
+        value, and a downstream op may still reference it by the original,
+        un-suffixed graph_idx. Strip the suffix from both sides before
+        comparing so the two spellings match.
         """
+        target = _base_graph_idx(graph_idx)
         for other in self.layer:
             if other is excluding_op:
                 continue
             for inp in other.input_tensors:
-                if str(inp.graph_idx) == str(graph_idx):
+                if _base_graph_idx(inp.graph_idx) == target:
                     return True
         return False
 
@@ -211,6 +238,26 @@ class GeneralMemoryScheduler:
             self.allocator.addTensor(0, length_model, trainable, type=TTYPE_STATIC_WEIGHT)
 
         all_t_size = 0
+
+        # Patch-based inference (InputResizer.py) tags the first op of the
+        # normal-inference block with is_start_of_normal_inference_block and
+        # forces ITS OWN input tensor's lifetime to start at 0 below, since
+        # that tensor is synthesized by hand-written reassembly C code with
+        # no real scheduler-tracked producer op. But that same synthesized
+        # value can have OTHER consumers too (e.g. a residual ADD several
+        # layers downstream, referencing it by its original un-suffixed
+        # graph_idx) -- their tensor objects need the exact same start-at-0
+        # treatment, or the allocator thinks they're only live from their own
+        # (much later) position and overlaps their address with something
+        # still genuinely in use during patch processing. Collect every
+        # boundary tensor's base graph_idx once so the per-tensor loop below
+        # can apply the override regardless of which op owns the tensor.
+        patch_boundary_base_ids = {
+            _base_graph_idx(boundary_op.input_tensors[0].graph_idx)
+            for boundary_op in self.layer
+            if boundary_op.params.get("is_start_of_normal_inference_block")
+        }
+
         # go through all tensors in the model
         for i, op in enumerate(self.layer):
             # get all unallocated tensors for this layer
@@ -255,7 +302,7 @@ class GeneralMemoryScheduler:
                     end_idx = i + 1
                 for idx in range(start_idx + 1, num_layers):
                     for input_t in self.layer[idx].input_tensors:
-                        if str(t.graph_idx) == str(input_t.graph_idx):
+                        if _base_graph_idx(t.graph_idx) == _base_graph_idx(input_t.graph_idx):
                             end_idx = idx + 1
                 # check if this is output
                 ttype = TTYPE_INFERNECE
@@ -266,13 +313,16 @@ class GeneralMemoryScheduler:
                             all_t_size += o.len
                             ttype = TTYPE_TRAINING_GRADIENT
 
-                # for patchbased inference, we need the input tensro to be allocated in the patch inference stage
-                if (
-                    "is_start_of_normal_inference_block" in op.params
-                    and op.params["is_start_of_normal_inference_block"]
-                ):
-                    if t in op.input_tensors:
-                        start_idx = 0
+                # for patchbased inference, we need the input tensor to be allocated in the patch inference stage --
+                # this applies to EVERY NORMAL-SIDE consumer of a patch-boundary tensor, not just the one op
+                # InputResizer.py happened to tag (see patch_boundary_base_ids comment above). Must NOT apply to
+                # the patch side's own ops (is_patch=True): last_patch_op's own output tensor naturally shares this
+                # same base graph_idx (it's literally what gets scattered into the reassembled tensor), but it's a
+                # small, per-patch-local scratch buffer reused across all patches, not the big reassembled one --
+                # forcing ITS lifetime to start at 0 too made the allocator collide the two at the same address
+                # (confirmed via a QEMU run where output_ptr and patch_output ended up pointing at the same byte).
+                if _base_graph_idx(t.graph_idx) in patch_boundary_base_ids and not op.get_layer_info().get("is_patch"):
+                    start_idx = 0
                 # add the tensor
                 t.allocator_idx = self.allocator.addTensor(start_idx, end_idx, t.len(), name=t.graph_idx, type=ttype)
                 # propagate the allocation to tensors with the same idx

@@ -16,6 +16,27 @@
 # Target ISA:  ARMv7E-M
 # ----------------------------------------------------------------------
 
+def _effective_input_hwc(layers, idx):
+    """H/W/C of the tensor flowing INTO layers[idx]. Conv/depthwise/pool/add
+    ops all carry this directly as input_h/input_w/input_c. StarBlockV's
+    self-gate MUL (act(conv(x))^2) doesn't -- mul.py's default_params has no
+    input_h/input_w/input_c at all, it only tracks a flat element count,
+    since the op's own math never needs the 2-D shape. But MUL here is
+    shape-preserving (elementwise square), so the tensor's real H/W/C is
+    whatever the immediately preceding op produced as output. Confirmed via
+    a real crash: split_idx=5 and 6 both land exactly on a self-gate MUL in
+    best_qat_mcu_model, and getPatchParams() assuming every layer has
+    input_h/input_w raised KeyError('input_h')."""
+    info = layers[idx].get_layer_info()
+    if info.get("input_h") is not None:
+        return info["input_h"], info["input_w"], info.get("input_c")
+    for i in range(idx - 1, -1, -1):
+        prev = layers[i].get_layer_info()
+        if prev.get("output_h") is not None:
+            return prev["output_h"], prev["output_w"], prev.get("output_c")
+    raise ValueError(f"could not resolve H/W/C feeding into layer {idx}")
+
+
 def getPatchParams(layers, split_idx, n_patch):
     patch_params = {}
 
@@ -25,17 +46,18 @@ def getPatchParams(layers, split_idx, n_patch):
 
     resolution = max(layers[0].get_layer_info()["input_h"], layers[0].get_layer_info()["input_w"])
     layer_cnt = layers[patch_params["layer_cnt"]].get_layer_info()
-    out_shape = max(layer_cnt["input_h"], layer_cnt["input_w"])
+    in_h, in_w, in_c = _effective_input_hwc(layers, patch_params["layer_cnt"])
+    out_shape = max(in_h, in_w)
     feat_stride = resolution // out_shape
     grain_size = out_shape // n_patch
 
     patch_params["single_rf"] = compute_receptive_field(layers, patch_params["layer_cnt"], 1)
-    patch_params["output_c"] = layer_cnt["input_c"]
-    patch_params["output_h"] = layer_cnt["output_h"]
-    patch_params["output_w"] = layer_cnt["output_w"]
+    patch_params["output_c"] = in_c
+    patch_params["output_h"] = layer_cnt.get("output_h", in_h)
+    patch_params["output_w"] = layer_cnt.get("output_w", in_w)
     patch_params["grain_rf"] = compute_receptive_field(layers, patch_params["layer_cnt"], grain_size)
     patch_params["grain_rf_height"] = compute_receptive_field(
-        layers, patch_params["layer_cnt"], layer_cnt["input_h"] // n_patch
+        layers, patch_params["layer_cnt"], in_h // n_patch
     )
     print("receptive field: single {} all {}".format(patch_params["single_rf"], patch_params["grain_rf"]))
 
