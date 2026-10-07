@@ -126,6 +126,24 @@ class GeneralMemoryScheduler:
                     return True
         return False
 
+    def _hasLaterConsumer(self, graph_idx, from_idx):
+        """True if some op AFTER position from_idx in self.layer still reads
+        a tensor with this graph_idx. Unlike _hasOtherConsumer (which looks
+        at every op, regardless of position, and is for deciding whether a
+        PRODUCER may destroy its OWN input in place as it writes its output
+        -- any consumer anywhere else is a problem there), this is for
+        deciding whether it's safe to recycle a tensor's buffer for a NEW
+        value once every op that still needed the OLD value has already run.
+        self.layer is in program order, so an "other consumer" positioned
+        before from_idx already read the value and is irrelevant; only a
+        later one still matters."""
+        target = _base_graph_idx(graph_idx)
+        for other in self.layer[from_idx + 1 :]:
+            for inp in other.input_tensors:
+                if _base_graph_idx(inp.graph_idx) == target:
+                    return True
+        return False
+
     def allocateMemory(self):
         # assign the same graph index for inplace operations
         # note: we need to handle stride == 2 for int8 depthwise to save memory
@@ -194,6 +212,37 @@ class GeneralMemoryScheduler:
                         for cnt, inp_tensor in enumerate(self.layer[following_idx].input_tensors):
                             if str(inp_tensor.graph_idx) == str(previous_output_idx):
                                 inp_tensor.graph_idx = op.input_tensors[0].graph_idx
+                if (
+                    op.params["op"] == "ADD"
+                    and op.params["input_dtype"] == "int8"
+                    and not self.tflite_op
+                    and len(op.input_tensors) == 2
+                ):
+                    # add_fpreq() (see its .c source) reads input1[k] and
+                    # input2[k] into locals before writing output[k] -- a
+                    # plain per-index loop with no cross-index dependency, so
+                    # it's safe to write the result back into whichever
+                    # operand's own buffer, as long as nothing still needs
+                    # that operand's ORIGINAL value afterward. A residual
+                    # add's skip operand was kept alive specifically so THIS
+                    # op could read it (see _hasOtherConsumer above) -- once
+                    # this op has read it, nothing else does, so its buffer
+                    # is free to reuse for the sum instead of allocating a
+                    # third, separate buffer. Check with _hasLaterConsumer
+                    # (not _hasOtherConsumer): an operand's one other
+                    # consumer is typically EARLIER in the program (e.g. the
+                    # depthwise conv that read the skip value before this
+                    # block's body ran), which already happened and doesn't
+                    # block reuse -- only a consumer still to come would.
+                    for candidate in (op.input_tensors[0], op.input_tensors[1]):
+                        if not self._hasLaterConsumer(candidate.graph_idx, i):
+                            previous_output_idx = op.output_tensors[0].graph_idx
+                            op.output_tensors[0].graph_idx = candidate.graph_idx
+                            for following_idx in range(i, len(self.layer)):
+                                for cnt, inp_tensor in enumerate(self.layer[following_idx].input_tensors):
+                                    if str(inp_tensor.graph_idx) == str(previous_output_idx):
+                                        inp_tensor.graph_idx = candidate.graph_idx
+                            break
 
         num_layers = len(self.layer)
         # add all trainable tensors as one tensor
