@@ -16,6 +16,8 @@
 # Target ISA:  ARMv7E-M
 # ----------------------------------------------------------------------
 
+import math
+
 from .allocator.firstFit import FirstFit
 from .constant import (
     FUSE_SGD_UPDATE_STR,
@@ -81,6 +83,13 @@ class GeneralMemoryScheduler:
         self.allocator = FirstFit(memory_limit, sort_by_lifetime, sort_by_start)
         self.outputTables = outputTables
         self.USE_INPLACE = inplace
+        # off by default on purpose: this is a newer, separately-opted-into
+        # optimization (see _reclaimPointwiseGrowthSpace) layered on top of
+        # USE_INPLACE's existing (always-on) aliasing. Existing callers that
+        # never touch this flag get byte-identical scheduling to before it
+        # existed -- only tflite_convert.py's --pointwise-overwrite flag
+        # turns it on.
+        self.ENABLE_POINTWISE_OVERWRITE = False
         self.mem_visual_path = mem_visual_path
         self.tflite_op = tflite_op
         self.dummy_address = dummy_address
@@ -144,6 +153,557 @@ class GeneralMemoryScheduler:
                     return True
         return False
 
+    def _findRectangle(self, allocator_idx):
+        for r in self.allocator.rectangles:
+            if r["idx"] == allocator_idx:
+                return r
+        return None
+
+    def _effectiveSize(self, r, asker_start):
+        """Mirrors FirstFit.fit()'s own stride2_inplace_idx shrink rule
+        (see firstFit.py): once the op asking is past stride2_inplace_idx,
+        a stride-2 depthwise conv has already run in-place on this
+        rectangle and downsampled it, so only a quarter of its nominal
+        size is still actually occupied -- the other three quarters were
+        freed by that same in-place write. All three collision-checking
+        helpers below (_regionFreeDuring, _blockingRectangles, and
+        _tightestFit's candidate generation) need this, or they'd treat
+        an already-shrunk rectangle as if it were still full-size and
+        wrongly refuse a placement fit() itself would already allow.
+        """
+        if r["stride2_inplace_idx"] is not None and asker_start > r["stride2_inplace_idx"]:
+            return math.ceil(r["size"] / 4)
+        return r["size"]
+
+    def _regionFreeDuring(self, addr_start, addr_size, t_start, t_end, exclude_idx):
+        """True if no OTHER placed rectangle's address range overlaps
+        [addr_start, addr_start+addr_size) during a time window that
+        overlaps [t_start, t_end)."""
+        addr_end = addr_start + addr_size
+        for r in self.allocator.rectangles:
+            if r["idx"] in exclude_idx or r["placement"] == -1:
+                continue
+            if r["start"] < t_end and t_start < r["end"]:  # time overlap
+                r_end = r["placement"] + self._effectiveSize(r, t_start)
+                if r["placement"] < addr_end and addr_start < r_end:  # address overlap
+                    return False
+        return True
+
+    def _reclaimPointwiseGrowthSpace(self):
+        """A stride-1, int8, 1x1 CONV_2D (a pointwise channel-expansion,
+        e.g. StaticSeparableTransition's pw) whose input has no other
+        consumer can write its output directly over its own input's
+        address range plus whatever free space sits immediately below it,
+        instead of needing a brand-new, separately-sized buffer.
+
+        Safe because convolve_1x1_s8*.c's kernels already copy each
+        pixel's full input into a small separate im2col scratch buffer
+        BEFORE computing and writing that same pixel's output (verified by
+        reading the kernel source, not assumed) -- so the write for pixel p
+        can never clobber pixel p's own not-yet-read input, only an
+        EARLIER pixel's input, which has already been consumed. Output
+        grows (output_c - input_c) bytes/pixel faster than input shrinks
+        away, so the write-front catches the read-front only after
+        (num_pixels - 1) * growth bytes -- as long as the free gap below
+        the input is at least that large, the sweep finishes before it
+        catches up. Confirmed empirically against this exact layer shape
+        before implementing: forcing naive graph_idx aliasing (no gap
+        accounting) made peak WORSE, not better -- this gap check is what
+        makes it actually safe instead of just hopeful.
+        """
+        self._merge_group = {}
+        for i, op in enumerate(self.layer):
+            p = op.params
+            if not (
+                p.get("op") == "CONV_2D"
+                and p.get("input_dtype") == "int8"
+                and not self.tflite_op
+                and p.get("kernel_h") == 1
+                and p.get("kernel_w") == 1
+                and p.get("stride_h") == 1
+                and p.get("stride_w") == 1
+            ):
+                continue
+            if op.get_layer_info().get("is_patch"):
+                continue  # patch-internal addressing is its own scheme -- not accounted for here
+            if self._hasLaterConsumer(op.input_tensors[0].graph_idx, i):
+                continue  # input still needed later -- can't destroy it
+            growth = p["output_c"] - p["input_c"]
+            if growth < 0:
+                continue  # output is SMALLER per-pixel -- the separate strict output_c<input_c
+                          # aliasing rule elsewhere handles that case; nothing to do here
+            # growth == 0 (same channel count) gives gap_needed == 0 below: the tightest,
+            # safest case of all -- a pure zero-offset alias, identical in spirit to the
+            # existing DEPTHWISE_CONV_2D in-place rule, just for a 1x1 conv. (A same-size
+            # aliasing rule WAS tried earlier and caused a regression -- but that was a
+            # *different*, zero-gap-UNAWARE implementation that just set matching graph_idx
+            # directly, with no lifetime/collision accounting; _tryApplyGapOverlap's
+            # explicit gap_needed=0 case goes through the exact same collision-checked,
+            # peak-verified, rollback-safe path as every strictly-positive growth case here.)
+            num_pixels = p["output_h"] * p["output_w"]
+            gap_needed = (num_pixels - 1) * growth
+            in_rec = self._findRectangle(op.input_tensors[0].allocator_idx)
+            out_rec = self._findRectangle(op.output_tensors[0].allocator_idx)
+            if in_rec is None or out_rec is None or in_rec["placement"] == -1:
+                continue
+            self._tryApplyGapOverlap(in_rec, out_rec, gap_needed)
+
+    def _stemConvHasViolation(self, H_in, W_in, C_in, C_out, stride, pad, kernel, gap):
+        """Simulates convolve_s8_kernel3_inputch3_stride2_pad1.c's exact
+        access pattern at the byte level: row-major output pixels, each
+        reading its full kernel x kernel x C_in window via im2col into a
+        separate scratch buffer BEFORE computing and writing that same
+        pixel's C_out output values (verified by reading the kernel
+        source) -- the same read-before-write property the 1x1 case
+        relies on, just across a 2D window instead of a single column.
+        Checks whether output_base = input_base - gap ever lets a write
+        reach an input byte some later-processed output pixel still needs
+        to read. Returns on the FIRST violation (only used as a yes/no
+        check by the binary search below, never to enumerate violations).
+
+        Unlike the 1x1 case, adjacent output ROWS share input rows (stride
+        2 with a 3-tall kernel re-reads the boundary row), so there's no
+        clean closed-form gap formula the way (num_pixels-1)*growth was
+        for 1x1 -- this simulates the real access order directly instead
+        of trusting a hand-derived expression for a 2D-window kernel.
+        """
+        H_out = (H_in + 2 * pad - kernel) // stride + 1
+        W_out = (W_in + 2 * pad - kernel) // stride + 1
+        in_size = H_in * W_in * C_in
+        read_done = bytearray(in_size)
+        for i_out_y in range(H_out):
+            base_y = i_out_y * stride - pad
+            for i_out_x in range(W_out):
+                base_x = i_out_x * stride - pad
+                for ky in range(kernel):
+                    y = base_y + ky
+                    if not (0 <= y < H_in):
+                        continue
+                    row_start = y * W_in
+                    for kx in range(kernel):
+                        x = base_x + kx
+                        if 0 <= x < W_in:
+                            start = (row_start + x) * C_in
+                            for c in range(C_in):
+                                read_done[start + c] = 1
+                out_pix = i_out_y * W_out + i_out_x
+                write_start = out_pix * C_out - gap
+                for c in range(C_out):
+                    idx = write_start + c
+                    if 0 <= idx < in_size and not read_done[idx]:
+                        return True
+        return False
+
+    def _minSafeGapStemConv(self, H_in, W_in, C_in, C_out, stride, pad, kernel):
+        """Binary search for the smallest gap where _stemConvHasViolation
+        is False. Monotonic and safe to binary-search: a bigger gap only
+        ever moves every write address strictly lower while every read
+        address is unaffected, so safety can only improve as gap grows --
+        confirmed empirically across the real shape and a small toy shape
+        before relying on it. gap = out_size is always a safe upper bound:
+        it pushes every write address strictly negative (out of the
+        input's own address range entirely), so it can never collide.
+        """
+        H_out = (H_in + 2 * pad - kernel) // stride + 1
+        W_out = (W_in + 2 * pad - kernel) // stride + 1
+        out_size = H_out * W_out * C_out
+        lo, hi = 0, out_size
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._stemConvHasViolation(H_in, W_in, C_in, C_out, stride, pad, kernel, mid):
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def _reclaimStemConvOverlap(self):
+        """The network's stem conv (3x3, stride 2, pad 1, int8, exactly 3
+        input channels -- convolve_s8_kernel3_inputch3_stride2_pad1.c's
+        own hardcoded assumption, confirmed by reading the dispatch logic
+        in operators/conv2d.py) can overlap its output with its raw input
+        image the same way the 1x1 growth case does, using a gap found by
+        simulation (_minSafeGapStemConv) instead of a closed-form formula,
+        since adjacent output rows here share input rows in a way the 1x1
+        case's per-pixel independence doesn't have.
+        """
+        for i, op in enumerate(self.layer):
+            p = op.params
+            if not (
+                p.get("op") == "CONV_2D"
+                and p.get("input_dtype") == "int8"
+                and not self.tflite_op
+                and p.get("kernel_h") == 3
+                and p.get("kernel_w") == 3
+                and p.get("stride_h") == 2
+                and p.get("stride_w") == 2
+                and p.get("padding") == 1
+                and p.get("input_c") == 3
+            ):
+                continue
+            if op.get_layer_info().get("is_patch"):
+                continue
+            if self._hasLaterConsumer(op.input_tensors[0].graph_idx, i):
+                continue
+            in_rec = self._findRectangle(op.input_tensors[0].allocator_idx)
+            out_rec = self._findRectangle(op.output_tensors[0].allocator_idx)
+            if in_rec is None or out_rec is None or in_rec["placement"] == -1:
+                continue
+            gap_needed = self._minSafeGapStemConv(
+                p["input_h"], p["input_w"], p["input_c"], p["output_c"], p["stride_h"], p["padding"], p["kernel_h"]
+            )
+            self._tryApplyGapOverlap(in_rec, out_rec, gap_needed)
+
+    def _tryApplyGapOverlap(self, in_rec, out_rec, gap_needed):
+        """Enforces output_base <= input_base - gap_needed between in_rec
+        and out_rec, mutating placements in place when a safe arrangement
+        exists, else leaving the schedule untouched. Shared by every op
+        family that reduces to this same relationship (currently the 1x1
+        growth-conv case and the 3x3/stride-2 stem-conv case below) --
+        only how each one computes gap_needed differs; once you have that
+        number, making it true safely is identical.
+
+        Both sides of the relationship are tried, because either address
+        can be the one already pinned by the generic allocator:
+          (a) input already placed -- slide output down to just touch it
+              from below (e.g. stage1's pw reusing the freed input-image
+              buffer below it).
+          (b) output already sitting at the lowest address available
+              (common: the generic allocator's largest-first sort put it
+              at 0) -- nothing is below it to slide into, but input
+              doesn't need to stay wherever it happened to land either: it
+              only needs to sit at output_base + gap_needed, inside
+              output's own span, instead of disjoint above it. Found by
+              tracing a real case where (a) always lost (output already
+              at address 0, so "cheaper than current" was never true)
+              while input was sitting ~300KB higher than the gap actually
+              requires.
+        If in_rec is itself already a member of an earlier merge group
+        (e.g. it's both this op's input AND some earlier op's merged
+        output), neither (a) nor (b) alone can move it without breaking
+        that earlier merge's own exact gap -- _tryGroupShiftAndMerge
+        handles that by shifting the whole group rigidly instead. The same
+        is true in the other direction: if out_rec is ALREADY a member of
+        some earlier group (e.g. this op's own input chains into a
+        different op family's output -- the 3x3 stem conv's output is
+        also the 1x1 rule's own input), branch (a) must not move it
+        directly either; it's simply skipped there (this specific op gets
+        no overlap -- a bidirectional group-shift isn't attempted, judged
+        not worth the added complexity for how rarely both sides are
+        grouped at once).
+
+        A mirror-image "use the slack ABOVE an inherited oversized slot
+        instead" case (reverse pixel order) was drafted and deliberately
+        removed -- NOT safe with convolve_1x1_s8*.c's existing forward-
+        order kernels (verified both algebraically and with a concrete
+        numeric example that it corrupts not-yet-read input). Every path
+        here stays within the forward-order-safe relationship; only which
+        side moves differs.
+        """
+        exclude_idx = {in_rec["idx"], out_rec["idx"]}
+        out_rec_grouped = out_rec["idx"] in self._merge_group and len(self._merge_group[out_rec["idx"]]) > 1
+        in_rec_grouped = in_rec["idx"] in self._merge_group and len(self._merge_group[in_rec["idx"]]) > 1
+        applied = False
+        new_out_start = in_rec["placement"] - gap_needed
+        if not out_rec_grouped and 0 <= new_out_start < out_rec["placement"]:
+            if self._regionFreeDuring(new_out_start, out_rec["size"], out_rec["start"], out_rec["end"], exclude_idx):
+                out_rec["placement"] = new_out_start
+                applied = True
+            elif self._tryCascadeRelocate(out_rec, new_out_start, exclude_idx):
+                applied = True
+        if not applied and not in_rec_grouped and out_rec["placement"] != -1:
+            new_in_start = out_rec["placement"] + gap_needed
+            if new_in_start < in_rec["placement"]:
+                if self._regionFreeDuring(new_in_start, in_rec["size"], in_rec["start"], in_rec["end"], exclude_idx):
+                    in_rec["placement"] = new_in_start
+                    applied = True
+                elif self._tryCascadeRelocate(in_rec, new_in_start, exclude_idx):
+                    applied = True
+        if not applied:
+            applied = self._tryGroupShiftAndMerge(in_rec, out_rec, gap_needed, exclude_idx)
+        if applied:
+            self._recordMergeGroup(in_rec["idx"], out_rec["idx"])
+        return applied
+
+    def _recordMergeGroup(self, idx_a, idx_b):
+        """Tracks which rectangles have had their relative address offset
+        pinned by a successful merge, transitively -- e.g. once 112 is
+        merged into 114, and then 114 (as part of that same group) is
+        later merged into 117, all three must move together as one rigid
+        unit from then on, or an earlier merge's exact gap would break.
+        """
+        group = self._merge_group.get(idx_a, {idx_a}) | self._merge_group.get(idx_b, {idx_b})
+        for idx in group:
+            self._merge_group[idx] = group
+
+    def _tryShiftGroupOutOfTheWay(self, group, shift, exclude_idx):
+        """Rigidly shifts every member of `group` by `shift` -- preserving
+        every internal gap relationship exactly, since every member moves
+        by the identical delta -- then resolves whatever that newly
+        collides with, using the same _tightestFit-based relocation
+        _tryCascadeRelocate's own blocker loop uses.
+
+        Refuses to touch any blocker that is itself a member of some
+        OTHER already-established merge group (size > 1): moving just one
+        member of a group this doesn't know about would silently break
+        that other group's own gap relationship -- bounded to moving one
+        group at a time rather than chasing that further.
+
+        Returns True if every member landed collision-free (mutating
+        self.allocator.rectangles in place); does NOT snapshot or roll
+        back on failure -- every caller already has its own snapshot
+        covering a broader change, so it owns that.
+        """
+        members = []
+        for idx in group:
+            m = self._findRectangle(idx)
+            if m is None:
+                return False
+            members.append(m)
+
+        for m in members:
+            m["placement"] += shift
+
+        full_exclude = set(group) | exclude_idx
+        for m in members:
+            if self._regionFreeDuring(m["placement"], m["size"], m["start"], m["end"], full_exclude):
+                continue
+            for blocker in self._blockingRectangles(m["placement"], m["size"], m["start"], m["end"], full_exclude):
+                if blocker["idx"] in self._merge_group and len(self._merge_group[blocker["idx"]]) > 1:
+                    return False
+                old_bp = blocker["placement"]
+                blocker["placement"] = -1
+                candidate = self._tightestFit(blocker, full_exclude)
+                if candidate is None or candidate == old_bp:
+                    return False
+                blocker["placement"] = candidate
+        return True
+
+    def _tryGroupShiftAndMerge(self, in_rec, out_rec, gap_needed, exclude_idx):
+        """Branches (a)/(b) above fail when in_rec is pinned at the address
+        floor by an EARLIER merge it's itself a member of (e.g. 114 is
+        out_rec's own base address AND also has 112 nested inside it via
+        its own merge) -- moving in_rec alone would break that earlier
+        merge's exact gap relationship, but shifting the WHOLE group
+        rigidly (via _tryShiftGroupOutOfTheWay) preserves every internal
+        gap exactly, since they're all just translated together. Nothing
+        is left modified unless the whole thing is both collision-free
+        and peak-non-increasing.
+        """
+        group = self._merge_group.get(in_rec["idx"])
+        if not group or len(group) < 2:
+            return False
+        shift = gap_needed - in_rec["placement"]
+        if shift <= 0:
+            return False  # in_rec already has enough room below it -- branch (b) would have used it
+
+        old_peak = self._currentPeak()
+        snapshot = {r["idx"]: r["placement"] for r in self.allocator.rectangles}
+
+        ok = self._tryShiftGroupOutOfTheWay(group, shift, exclude_idx | {out_rec["idx"]})
+
+        if ok:
+            out_rec["placement"] = in_rec["placement"] - gap_needed
+            if out_rec["placement"] < 0 or not self._regionFreeDuring(
+                out_rec["placement"], out_rec["size"], out_rec["start"], out_rec["end"],
+                set(group) | {out_rec["idx"]},
+            ):
+                ok = False
+
+        # Strict "<", not "<=": a "doesn't make it worse right now" bar was
+        # tried here, reasoning that a later op still unprocessed (e.g.
+        # i=8's own merge) might be the thing this shift actually unblocks,
+        # with its benefit not showing up in _currentPeak() until that
+        # later op's own turn. Traced a real case where that bet didn't
+        # pay off -- pinning the group higher to satisfy THIS merge (which
+        # had no standalone benefit of its own) ended up costing far more
+        # once later same-size merges needed the group to stay low, a cost
+        # that outweighed anything it unblocked (402,054 vs 551,888 on the
+        # real model, measured directly). A peak-neutral shift is kept only
+        # when it's ALSO strictly better eventually; since that can't be
+        # known in a single forward pass, require the improvement to be
+        # visible immediately, same as every other accept-check here.
+        if ok and self._currentPeak() < old_peak:
+            return True
+
+        for r in self.allocator.rectangles:
+            r["placement"] = snapshot[r["idx"]]
+        return False
+
+    def _currentPeak(self):
+        peak = 0
+        for r in self.allocator.rectangles:
+            if r["placement"] != -1:
+                top = r["placement"] + r["size"]
+                if top > peak:
+                    peak = top
+        return peak
+
+    def _blockingRectangles(self, addr_start, addr_size, t_start, t_end, exclude_idx):
+        """Rectangles whose address range collides with [addr_start,
+        addr_start+addr_size) during a time window overlapping [t_start,
+        t_end) -- the set _regionFreeDuring would have objected to."""
+        addr_end = addr_start + addr_size
+        blockers = []
+        for r in self.allocator.rectangles:
+            if r["idx"] in exclude_idx or r["placement"] == -1:
+                continue
+            if r["start"] < t_end and t_start < r["end"]:
+                r_end = r["placement"] + self._effectiveSize(r, t_start)
+                if r["placement"] < addr_end and addr_start < r_end:
+                    blockers.append(r)
+        return blockers
+
+    def _tightestFit(self, rec, exclude_idx):
+        """Correct lowest-valid-address search for rec, used instead of
+        allocator.fit() during cascade relocation.
+
+        The optimal placement for a rectangle is always either address 0
+        or immediately above some other time-overlapping rectangle's top
+        -- so checking exactly that finite candidate set via the
+        already-verified _regionFreeDuring finds the true tightest slot.
+        This matters because FirstFit.fit() mutates its own `slots` list
+        (.remove()/.append()) while iterating over it with a plain `for s
+        in slots:` loop -- a classic hazard that can skip a list item
+        right after a removal shifts things down. Traced a real case where
+        this caused fit() to settle for a valid-but-not-cheapest address
+        (missing a free slot it should have found), rather than fix that
+        shared routine (used by every model's baseline schedule and
+        required to stay byte-identical), this search bypasses it only
+        here, inside the opt-in cascade path.
+        """
+        candidates = {0}
+        for r in self.allocator.rectangles:
+            if r["idx"] in exclude_idx or r["placement"] == -1:
+                continue
+            if r["start"] < rec["end"] and rec["start"] < r["end"]:
+                candidates.add(r["placement"] + self._effectiveSize(r, rec["start"]))
+        for addr in sorted(candidates):
+            if self._regionFreeDuring(addr, rec["size"], rec["start"], rec["end"], exclude_idx):
+                return addr
+        return None
+
+    def _compactSchedule(self):
+        """One-shot post-hoc tightening pass over the allocator's own
+        output, before any pointwise-overwrite pairing is introduced.
+
+        FirstFit.fit() (see _tightestFit's docstring for the exact
+        mechanism) can leave an individual rectangle at a valid-but-not-
+        cheapest address -- traced a real case of this independent of
+        anything pointwise-overwrite-specific. Re-checks every already-
+        placed rectangle with _tightestFit and slides it down whenever a
+        strictly lower valid address exists, one rectangle at a time, each
+        move touching nothing else -- so every move is non-increasing for
+        the overall peak by construction, never needs a rollback. Repeats
+        until a full pass makes no further change, since moving one
+        rectangle down can free room for another.
+        """
+        for _ in range(len(self.allocator.rectangles) + 1):
+            changed = False
+            order = sorted(
+                (r for r in self.allocator.rectangles if r["placement"] != -1),
+                key=lambda r: r["placement"],
+            )
+            for r in order:
+                old_placement = r["placement"]
+                r["placement"] = -1
+                candidate = self._tightestFit(r, {r["idx"]})
+                if candidate is not None and candidate < old_placement:
+                    r["placement"] = candidate
+                    changed = True
+                else:
+                    r["placement"] = old_placement
+            if not changed:
+                break
+
+    def _tryCascadeRelocate(self, out_rec, new_start, exclude_idx):
+        """When _reclaimPointwiseGrowthSpace's direct region isn't free,
+        try relocating whatever's blocking it elsewhere via _tightestFit
+        (a direct, correct lowest-valid-address search -- see its
+        docstring for why this is used instead of the allocator's own
+        fit()), then re-check. All-or-nothing and peak-checked: if any
+        blocker has nowhere better to go, or moving everything doesn't
+        actually lower the overall peak, every change made here is rolled
+        back and nothing is left modified -- this can only ever leave the
+        schedule the same or smaller, never bigger.
+
+        A blocker that is itself a member of an already-established merge
+        group (size > 1, tracked in self._merge_group) is never relocated
+        on its own -- moving just that one member, without its partner(s),
+        would silently break that other merge's exact gap relationship
+        (traced a real case of exactly this: it pushed a blocker to an
+        address that violated the required output_base <= input_base -
+        gap_needed relationship, an actual unsafe overlap, not just a
+        missed optimization). Instead the WHOLE group is rigidly shifted
+        out of the way via _tryShiftGroupOutOfTheWay, which preserves
+        every internal gap exactly; if that isn't possible, the cascade
+        is abandoned rather than touching the group partially.
+        """
+        blockers = self._blockingRectangles(new_start, out_rec["size"], out_rec["start"], out_rec["end"], exclude_idx)
+        if not blockers:
+            return False
+        old_peak = self._currentPeak()
+        snapshot = {r["idx"]: r["placement"] for r in self.allocator.rectangles}
+
+        # fit() just finds *a* valid spot for a blocker -- left alone, it
+        # often re-derives the exact same address it already had, since
+        # nothing about ITS OWN constraints changed. A temporary reservation
+        # over the region we actually want forces fit() to look elsewhere
+        # instead of trivially handing back the status quo.
+        reservation = {
+            "start": out_rec["start"], "end": out_rec["end"], "size": out_rec["size"],
+            "placement": new_start, "name": "_reservation", "idx": -2, "stride2_inplace_idx": None,
+        }
+        self.allocator.rectangles.append(reservation)
+
+        moved_idx = set(exclude_idx)
+        handled_groups = set()
+        for blocker in blockers:
+            group = self._merge_group.get(blocker["idx"])
+            if group and len(group) > 1:
+                gkey = frozenset(group)
+                if gkey in handled_groups:
+                    continue  # this blocker's whole group was already shifted for an earlier blocker in it
+                shift = (new_start + out_rec["size"]) - blocker["placement"]
+                if shift <= 0 or not self._tryShiftGroupOutOfTheWay(group, shift, exclude_idx | {out_rec["idx"]}):
+                    self.allocator.rectangles.remove(reservation)
+                    for r in self.allocator.rectangles:
+                        r["placement"] = snapshot[r["idx"]]
+                    return False
+                handled_groups.add(gkey)
+                moved_idx |= group
+                continue
+            old_placement = blocker["placement"]
+            blocker["placement"] = -1  # treat this one as not-yet-placed during the search
+            candidate = self._tightestFit(blocker, exclude_idx)
+            if candidate is None or candidate == old_placement:
+                # nowhere better than where it already was (or nowhere at
+                # all) -- this cascade can't make progress, abandon it
+                self.allocator.rectangles.remove(reservation)
+                for r in self.allocator.rectangles:
+                    r["placement"] = snapshot[r["idx"]]
+                return False
+            blocker["placement"] = candidate
+            moved_idx.add(blocker["idx"])
+
+        self.allocator.rectangles.remove(reservation)
+
+        if not self._regionFreeDuring(new_start, out_rec["size"], out_rec["start"], out_rec["end"], moved_idx):
+            # moving the named blockers wasn't enough -- something else
+            # (not in our blocker list, e.g. revealed only after moving one
+            # of them) still collides
+            for r in self.allocator.rectangles:
+                r["placement"] = snapshot[r["idx"]]
+            return False
+
+        out_rec["placement"] = new_start
+        if self._currentPeak() >= old_peak:
+            # technically-valid, but didn't actually help -- not worth the
+            # extra moved buffers, roll back
+            for r in self.allocator.rectangles:
+                r["placement"] = snapshot[r["idx"]]
+            return False
+        return True
+
     def allocateMemory(self):
         # assign the same graph index for inplace operations
         # note: we need to handle stride == 2 for int8 depthwise to save memory
@@ -165,6 +725,45 @@ class GeneralMemoryScheduler:
                     ):
                         self.layer[i + 1].input_tensors[0].graph_idx = op.input_tensors[0].graph_idx
                     # update following ops' tensors
+                    for following_idx in range(i, len(self.layer)):
+                        for cnt, inp_tensor in enumerate(self.layer[following_idx].input_tensors):
+                            if str(inp_tensor.graph_idx) == str(previous_output_idx):
+                                inp_tensor.graph_idx = op.input_tensors[0].graph_idx
+                if (
+                    self.ENABLE_POINTWISE_OVERWRITE
+                    and op.params["op"] == "CONV_2D"
+                    and op.params["input_dtype"] == "int8"
+                    and not self.tflite_op
+                    and op.params.get("kernel_h") == 1
+                    and op.params.get("kernel_w") == 1
+                    and op.params.get("stride_h") == 1
+                    and op.params.get("stride_w") == 1
+                    and op.params["output_c"] < op.params["input_c"]
+                    and not self._hasLaterConsumer(op.input_tensors[0].graph_idx, i)
+                ):
+                    # Generalizes the DEPTHWISE_CONV_2D in-place case above to
+                    # any stride-1 1x1 CONV_2D (full channel mixing, not just
+                    # grouped) whose output has no more channels per pixel
+                    # than its input -- e.g. a squeeze-style pointwise conv,
+                    # or (once chained through a prior growth hop) a later
+                    # hop that happens to fit inside an inherited oversized
+                    # slot. Safe for the same reason convolve_1x1_s8*.c's
+                    # kernels are already safe for DEPTHWISE_CONV_2D aliasing:
+                    # they copy each pixel's full input into a small separate
+                    # scratch buffer before computing and writing that same
+                    # pixel's (no bigger) output, so the write for pixel p
+                    # can never reach into pixel p+1's not-yet-read input --
+                    # unlike the DEPTHWISE case, no stride/shape restriction
+                    # beyond 1x1/stride-1 is needed, since output_c<=input_c
+                    # alone guarantees the write-front never outruns the
+                    # read-front. _hasLaterConsumer (not _hasOtherConsumer,
+                    # see its own docstring) because a 1x1 conv's own
+                    # immediate predecessor commonly shares its input's
+                    # identity already (e.g. a DEPTHWISE_CONV_2D just aliased
+                    # above) -- _hasOtherConsumer would see that EARLIER
+                    # reference and wrongly refuse to alias.
+                    previous_output_idx = op.output_tensors[0].graph_idx
+                    op.output_tensors[0].graph_idx = op.input_tensors[0].graph_idx
                     for following_idx in range(i, len(self.layer)):
                         for cnt, inp_tensor in enumerate(self.layer[following_idx].input_tensors):
                             if str(inp_tensor.graph_idx) == str(previous_output_idx):
@@ -307,6 +906,26 @@ class GeneralMemoryScheduler:
             if boundary_op.params.get("is_start_of_normal_inference_block")
         }
 
+        # Every EXISTING aliasing case above (DEPTHWISE_CONV_2D, the
+        # TRANSPOSE_CONV_2D special case, MUL's self-gate, ADD's residual
+        # reuse) only ever merges same-size tensors, so addTensor() below
+        # using whichever tensor happens to be processed first's own len()
+        # has always been correct by construction. The new CONV_2D rule
+        # above merges a SMALLER output onto a (possibly already-oversized,
+        # chained) input -- if that slot's size were taken from whichever
+        # tensor claims it first, a later, genuinely-bigger member of the
+        # same chain could silently get an undersized allocation. Computed
+        # and used only under the same flag as that new rule, so every
+        # existing (same-size-only) case gets byte-identical sizes either way.
+        max_len_by_idx = {}
+        if self.ENABLE_POINTWISE_OVERWRITE:
+            for o in self.layer:
+                for t in list(o.input_tensors) + list(o.output_tensors):
+                    k = _base_graph_idx(t.graph_idx)
+                    tl = t.len()
+                    if k not in max_len_by_idx or tl > max_len_by_idx[k]:
+                        max_len_by_idx[k] = tl
+
         # go through all tensors in the model
         for i, op in enumerate(self.layer):
             # get all unallocated tensors for this layer
@@ -331,6 +950,17 @@ class GeneralMemoryScheduler:
                         and not self.tflite_op
                         and op.params["stride_h"] == 1
                         and op.params["stride_w"] == 1
+                    )
+                    and not (
+                        self.ENABLE_POINTWISE_OVERWRITE
+                        and op.params["op"] == "CONV_2D"
+                        and op.params["input_dtype"] == "int8"
+                        and not self.tflite_op
+                        and op.params.get("kernel_h") == 1
+                        and op.params.get("kernel_w") == 1
+                        and op.params.get("stride_h") == 1
+                        and op.params.get("stride_w") == 1
+                        and op.params["output_c"] < op.params["input_c"]
                     )
                 ):
                     if t.allocator_idx is None:
@@ -373,7 +1003,8 @@ class GeneralMemoryScheduler:
                 if _base_graph_idx(t.graph_idx) in patch_boundary_base_ids and not op.get_layer_info().get("is_patch"):
                     start_idx = 0
                 # add the tensor
-                t.allocator_idx = self.allocator.addTensor(start_idx, end_idx, t.len(), name=t.graph_idx, type=ttype)
+                tensor_size = max_len_by_idx.get(_base_graph_idx(t.graph_idx), t.len()) if self.ENABLE_POINTWISE_OVERWRITE else t.len()
+                t.allocator_idx = self.allocator.addTensor(start_idx, end_idx, tensor_size, name=t.graph_idx, type=ttype)
                 # propagate the allocation to tensors with the same idx
                 for j in range(i + 1, num_layers):
                     opp = self.layer[j]
@@ -471,6 +1102,17 @@ class GeneralMemoryScheduler:
         # Reorder the rectangles to decide which tensor needs to be scheduled first
         self.allocator.sortSize()
         self.allocator.allocate()
+        if self.ENABLE_POINTWISE_OVERWRITE:
+            # Tighten first, on the untouched base schedule, before
+            # _reclaimPointwiseGrowthSpace introduces pairs whose relative
+            # offset (output_base vs input_base) must stay exact -- a later
+            # independent, per-rectangle compaction pass could slide one
+            # member of such a pair without its partner and reintroduce an
+            # unsafe overlap. Running compaction only here, before any pair
+            # exists, sidesteps that risk entirely.
+            self._compactSchedule()
+            self._reclaimPointwiseGrowthSpace()
+            self._reclaimStemConvOverlap()
         self.allocator.visualize(self.mem_visual_path)
         self._enlargeBuffer("input_output", self.allocator.get_peak())
 
