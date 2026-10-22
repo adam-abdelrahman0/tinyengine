@@ -640,18 +640,34 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
         string = "#define PEAK_MEM " + str(schedule.peakmem) + "\n" + "#define MODEL_SIZE " + str(schedule.flash) + "\n"
         fp.write(string + "\n")
 
-        string = "static signed char buffer[" + str(schedule.peakmem) + "];\n"
-        fp.write(string)
-        accumulate_ptr = 0
-        string = "static signed char *buffer0 = &buffer[" + str(accumulate_ptr) + "];\n"
-        accumulate_ptr += int(schedule.buffers["input_output"])
-        fp.write(string)
+        # sbuf/kbuf are read and written as 32-bit words (and the compiler may
+        # pair those accesses into STRD/LDRD, which fault on a Cortex-M7 when the
+        # address isn't 4-byte aligned), so each starts on a 4-byte boundary.
+        # The sizes above aren't guaranteed to be multiples of 4 (e.g. an
+        # im2col buffer of 4418 bytes put kbuf at offset 292930, 2 mod 4), so
+        # pad up to the next multiple. The array is declared aligned and, if
+        # the padding pushes the end past PEAK_MEM, a few bytes larger than it.
+        def align4(n):
+            return (n + 3) & ~3
 
-        string = "static int16_t *sbuf = (int16_t *)&buffer[" + str(accumulate_ptr) + "];\n"
+        accumulate_ptr = 0
+        buffer0_ptr = accumulate_ptr
+        accumulate_ptr += int(schedule.buffers["input_output"])
+        accumulate_ptr = align4(accumulate_ptr)
+        sbuf_ptr = accumulate_ptr
         accumulate_ptr += int(schedule.buffers["im2col"])
-        fp.write(string)
-        string = "static int16_t *kbuf = (int16_t *)&buffer[" + str(accumulate_ptr) + "];\n"
+        accumulate_ptr = align4(accumulate_ptr)
+        kbuf_ptr = accumulate_ptr
         accumulate_ptr += int(schedule.buffers["kernel"])
+
+        buffer_len = max(int(schedule.peakmem), accumulate_ptr)
+        string = "static signed char buffer[" + str(buffer_len) + "] __attribute__((aligned(4)));\n"
+        fp.write(string)
+        string = "static signed char *buffer0 = &buffer[" + str(buffer0_ptr) + "];\n"
+        fp.write(string)
+        string = "static int16_t *sbuf = (int16_t *)&buffer[" + str(sbuf_ptr) + "];\n"
+        fp.write(string)
+        string = "static int16_t *kbuf = (int16_t *)&buffer[" + str(kbuf_ptr) + "];\n"
         fp.write(string)
         string = "const int SBuffer_size = " + str(int(schedule.buffers["im2col"])) + ";\n"
         fp.write(string)
