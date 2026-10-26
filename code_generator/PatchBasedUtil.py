@@ -53,8 +53,11 @@ def getPatchParams(layers, split_idx, n_patch):
 
     patch_params["single_rf"] = compute_receptive_field(layers, patch_params["layer_cnt"], 1)
     patch_params["output_c"] = in_c
-    patch_params["output_h"] = layer_cnt.get("output_h", in_h)
-    patch_params["output_w"] = layer_cnt.get("output_w", in_w)
+    # The tiles are reassembled into the tensor feeding layers[split_idx], so
+    # the row stride is that tensor's width, not the split layer's output width
+    # (they differ when the split layer is stride 2).
+    patch_params["output_h"] = in_h
+    patch_params["output_w"] = in_w
     patch_params["grain_rf"] = compute_receptive_field(layers, patch_params["layer_cnt"], grain_size)
     patch_params["grain_rf_height"] = compute_receptive_field(
         layers, patch_params["layer_cnt"], in_h // n_patch
