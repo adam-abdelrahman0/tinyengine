@@ -17,6 +17,7 @@
 # ----------------------------------------------------------------------
 
 import math
+import os
 
 from .allocator.firstFit import FirstFit
 from .constant import (
@@ -212,6 +213,8 @@ class GeneralMemoryScheduler:
         makes it actually safe instead of just hopeful.
         """
         self._merge_group = {}
+        if os.environ.get("TE_NO_GROWTH"):  # debug bisect
+            return
         for i, op in enumerate(self.layer):
             p = op.params
             if not (
@@ -1111,8 +1114,10 @@ class GeneralMemoryScheduler:
             # unsafe overlap. Running compaction only here, before any pair
             # exists, sidesteps that risk entirely.
             self._compactSchedule()
+            # debug bisect: TE_NO_GROWTH=1 / TE_NO_STEM=1 skip that pass
             self._reclaimPointwiseGrowthSpace()
-            self._reclaimStemConvOverlap()
+            if not os.environ.get("TE_NO_STEM"):
+                self._reclaimStemConvOverlap()
         self.allocator.visualize(self.mem_visual_path)
         self._enlargeBuffer("input_output", self.allocator.get_peak())
 
