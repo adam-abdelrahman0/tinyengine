@@ -219,7 +219,26 @@ class Conv2d(basicOperator):
         else:
             kernel_h = params["kernel_h"]
             # function name
-            if params["kernel_h"] == 1:
+            stride_h, stride_w = params["stride_h"] or 1, params["stride_w"] or 1  # None on 1x1-spatial layers
+            strided_1x1 = params["kernel_h"] == 1 and (stride_h != 1 or stride_w != 1)
+            if strided_1x1:
+                # every other convolve_1x1_s8* kernel walks the input contiguously and ignores stride,
+                # so a strided 1x1 conv would silently read the wrong pixels
+                if (
+                    stride_h != stride_w
+                    or params["output_c"] % 2 != 0
+                    or params["need_Bmask"]
+                    or params["first_k_channel"] is not None
+                    or fp_requantize
+                    or FP_output
+                    or unsigned_input
+                ):
+                    raise NotImplementedError(
+                        f"1x1 CONV_2D with stride {stride_h}x{stride_w} is only supported "
+                        "by convolve_1x1_s8_strided (square stride, even output_c, plain int8 requant)"
+                    )
+                function_name = "convolve_1x1_s8_strided"
+            elif params["kernel_h"] == 1:
                 # find the proper function
                 if params["output_c"] % 2 != 0:
                     if (
@@ -320,6 +339,8 @@ class Conv2d(basicOperator):
             string += "sbuf"
             if kernel_h == 3 and params["stride_h"] == 2 and params["padding"] == 1:
                 string += ",kbuf"
+            if strided_1x1:
+                string += f",{stride_h}"
 
             # pad value for kernel size > 1
             if kernel_h > 1:
