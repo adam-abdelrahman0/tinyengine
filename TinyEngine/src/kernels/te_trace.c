@@ -14,7 +14,7 @@ void te_trace(const char *tensor_idx, const q7_t *p, int n)
 	for (int i = 0; i < n; i++)
 		sum += p[i];
 	printf("TRACE %s n=%d sum=%ld first=", tensor_idx, n, (long) sum);
-	for (int i = 0; i < 8 && i < n; i++)
+	for (int i = 0; i < 256 && i < n; i++)
 		printf("%d,", p[i]);
 	printf("\r\n");
 }
