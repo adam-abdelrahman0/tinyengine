@@ -65,6 +65,10 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x, con
                                   const int32_t out_activation_max, q7_t *output, const uint16_t output_x,
                                   const uint16_t output_y, const uint16_t output_ch, q15_t *runtime_buf);
 
+/* per-layer debug summary, see src/kernels/te_trace.c */
+extern volatile int g_te_trace_on;
+void te_trace(const char *tensor_idx, const q7_t *p, int n);
+
 /* 1x1 conv with stride > 1: output pixel (y, x) reads input pixel (y * stride, x * stride) */
 tinyengine_status convolve_1x1_s8_strided(const q7_t *input, const uint16_t input_x, const uint16_t input_y,
                                           const uint16_t input_ch, const q7_t *kernel, const int32_t *bias,

@@ -380,7 +380,9 @@ void update_SGD(float learning_rate){\n"""
         }
     }
     //stage 2
-    invoke(NULL);
+"""
+                + self._stage2InputTrace(schedule, last_patch_idx, first_bufferstr_for_normal_inference)
+                + """    invoke(NULL);
 }"""
             )
             string += """
@@ -488,6 +490,25 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
         assert fused_str.endswith(");"), f"unexpected conv call format, can't fuse safely: {fused_str!r}"
         return fused_str[:-2] + extra_args + ");\n"
 
+    def _traceStr(self, op):
+        """TE_TRACE=1 debug build: a te_trace() call after the layer, naming the TFLite tensor it produced."""
+        if not os.environ.get("TE_TRACE"):
+            return ""
+        p, t = op.params, op.output_tensors[0]
+        key = "output_buf_add" if "output_buf_add" in p else "input_buf_add"
+        if key not in p or t.dtype != "int8":
+            return ""
+        # params["output_idx"] is the TFLite tensor index; t.graph_idx is rewritten by in-place aliasing
+        idx = p.get("output_idx", t.graph_idx)
+        return f'te_trace("{idx}", {op._getBufferstr(p[key], p[key + "_offset"])}, {t.len()});\n'
+
+    def _stage2InputTrace(self, schedule, last_patch_idx, buf_str):
+        if not os.environ.get("TE_TRACE"):
+            return ""
+        nxt = schedule.layer[last_patch_idx + 1]
+        t = nxt.input_tensors[0]
+        return f'    te_trace("{nxt.params.get("input_idx", t.graph_idx)}", {buf_str}, {t.len()});\n'
+
     def _genInvoke(self):
         fp = self.source_handle
         string = "void invoke(float* labels){\n"
@@ -544,6 +565,7 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
                 string = self._genOpstr(op)
                 fp.write(string)
 
+            fp.write(self._traceStr(op))
             i += 1
 
         string = "}\n"
