@@ -71,7 +71,6 @@ tinyengine_status convolve_1x1_s8_selfgate(
     const float mul_output_scale, const float mul_output_zero) {
     (void)input_x;
     (void)input_y;
-    (void)runtime_buf; /* unused in this scalar path; kept for call-site symmetry with convolve_1x1_s8() */
 
     const int32_t num_pixels = (int32_t)output_x * (int32_t)output_y;
     const float inv_mul_output_scale = 1.0f / mul_output_scale;
@@ -80,6 +79,17 @@ tinyengine_status convolve_1x1_s8_selfgate(
         const q7_t *x_row = &input[p * input_ch];
         q7_t *out_row = &output[p * output_ch];
 
+        /* Copy this pixel's whole input row to scratch before writing any of
+         * its outputs. The scheduler's pointwise-overwrite growth gap lets
+         * the output overlap the input buffer and is only safe if a pixel's
+         * input is fully consumed before that pixel's first output byte is
+         * written (convolve_1x1_s8() does the same via its im2col copy). The
+         * last pixel's output starts exactly at its own input row, so reading
+         * x_row per output channel would see already-overwritten values. */
+        for (int32_t ci = 0; ci < input_ch; ci++) {
+            runtime_buf[ci] = (q15_t)(x_row[ci] + input_offset);
+        }
+
         for (int32_t o = 0; o < output_ch; o++) {
             const q7_t *w_row = &kernel[o * input_ch];
 
@@ -87,7 +97,7 @@ tinyengine_status convolve_1x1_s8_selfgate(
              * scalar tail case */
             q31_t acc = bias[o];
             for (int32_t ci = 0; ci < input_ch; ci++) {
-                acc += ((int32_t)x_row[ci] + input_offset) * (int32_t)w_row[ci];
+                acc += (int32_t)runtime_buf[ci] * (int32_t)w_row[ci];
             }
 
             /* requantize + RELU6 clamp -- identical to convolve_1x1_s8.c */
