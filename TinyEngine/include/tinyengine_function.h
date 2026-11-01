@@ -69,6 +69,9 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x, con
 extern volatile int g_te_trace_on;
 void te_trace(const char *tensor_idx, const q7_t *p, int n);
 
+/* per-layer cycle profile, defined in the board's main.c; genModel.c calls it only if generated with TE_PROF=1 */
+void te_prof(int id);
+
 /* 1x1 conv with stride > 1: output pixel (y, x) reads input pixel (y * stride, x * stride) */
 tinyengine_status convolve_1x1_s8_strided(const q7_t *input, const uint16_t input_x, const uint16_t input_y,
                                           const uint16_t input_ch, const q7_t *kernel, const int32_t *bias,

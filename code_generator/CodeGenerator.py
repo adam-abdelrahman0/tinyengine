@@ -81,6 +81,7 @@ class CodeGenerator:
     ):
         self.MemSche = memsche
         self.fuse_selfgate = fuse_selfgate
+        self._prof_n = 0  # next te_prof() id, see _profStr
 
         # Check if path exists, create it if not
         if not os.path.exists(include_path):
@@ -335,7 +336,9 @@ void update_SGD(float learning_rate){\n"""
                 //skip right
                 patch_input += pad_r * 3;
             }
-            invoke_1patch(pad_t,pad_b,pad_l,pad_r);
+"""
+                + self._profStr("s1 patch input copy (all tiles)", indent=12)
+                + """            invoke_1patch(pad_t,pad_b,pad_l,pad_r);
             /* concat the output from buffer0 (this is set manually for now) */
             q7_t* output_ptr = """
                 + f"{first_bufferstr_for_normal_inference};"
@@ -377,7 +380,9 @@ void update_SGD(float learning_rate){\n"""
                 + """                    }
                 }
             }
-        }
+"""
+                + self._profStr("s1 patch reassemble (all tiles)", indent=12)
+                + """        }
     }
     //stage 2
 """
@@ -423,6 +428,7 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
                     string = self._genOpstr(op)
                     fp.write(string)
 
+                fp.write(self._profStr(self._opLabel("s1", layercnt - 1, layer_info, string)))
                 patch_layers.append(schedule.layer[i])
 
             # remove these layers for patching for the following code gen
@@ -490,6 +496,19 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
         assert fused_str.endswith(");"), f"unexpected conv call format, can't fuse safely: {fused_str!r}"
         return fused_str[:-2] + extra_args + ");\n"
 
+    def _profStr(self, label, indent=0):
+        """TE_PROF=1 build: a te_prof(id) mark after a layer. main.c adds the DWT cycles since the previous
+        mark to slot `id` (diag/profile.py reads them back); the label is parsed from the comment."""
+        if not os.environ.get("TE_PROF"):
+            return ""
+        n, self._prof_n = self._prof_n, self._prof_n + 1
+        return " " * indent + f"te_prof({n}); /* {label} */\n"
+
+    def _opLabel(self, stage, idx, info, code):
+        m = re.match(r"\s*(\w+)\(", code)
+        shape = "x".join(str(info[k]) for k in ("output_h", "output_w", "output_c") if info.get(k) is not None)
+        return f"{stage} L{idx} {info['op']} {m.group(1) if m else '-'} {shape}".strip()
+
     def _traceStr(self, op):
         """TE_TRACE=1 debug build: a te_trace() call after the layer, naming the TFLite tensor it produced."""
         if not os.environ.get("TE_TRACE"):
@@ -525,6 +544,7 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
             if fused_str is not None:
                 fp.write("/* layer " + str(i) + ":CONV_2D+MUL fused (self-gate relu6(conv(x))^2) */\n")
                 fp.write(fused_str)
+                fp.write(self._profStr(self._opLabel("s2", i, dict(layer_info, op="CONV_2D+MUL"), fused_str)))
                 i += 2
                 continue
 
@@ -566,6 +586,7 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
                 fp.write(string)
 
             fp.write(self._traceStr(op))
+            fp.write(self._profStr(self._opLabel("s2", i, layer_info, string)))
             i += 1
 
         string = "}\n"
