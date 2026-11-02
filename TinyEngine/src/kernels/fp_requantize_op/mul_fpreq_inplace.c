@@ -37,6 +37,24 @@ tinyengine_status mul_fpreq_inplace(int size, int8_t* data, const float scale, c
   const float inv_output_scale = 1.0f / output_scale;
   int i = 0;
 
+  /* The result depends only on the int8 in data[i], so for anything bigger than the table itself evaluate the
+   * formula once per possible value (same expression as the loops below) and look every element up instead:
+   * about 2 cycles per element against about 23 for the float math. */
+  if (size >= 256) {
+    int8_t lut[256];
+    for (int q = -128; q < 128; q++) {
+      const float v = ((float) q - zero) * scale;
+      int32_t o = (int32_t) roundf(v * v * inv_output_scale + zero_y);
+      o = TN_MAX(o, -128); o = TN_MIN(o, 127);
+      lut[q + 128] = (int8_t) o;
+    }
+    const int8_t* t = lut + 128;
+    for (; i + 3 < size; i += 4) {
+      const int8_t a = t[data[i]], b = t[data[i + 1]], c = t[data[i + 2]], d = t[data[i + 3]];
+      data[i] = a; data[i + 1] = b; data[i + 2] = c; data[i + 3] = d;
+    }
+  }
+
   for (; i + 1 < size; i += 2) {
     const float v0 = ((float) data[i]     - zero) * scale;
     const float v1 = ((float) data[i + 1] - zero) * scale;
