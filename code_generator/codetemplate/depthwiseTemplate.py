@@ -525,6 +525,8 @@ class depthwiseInplace:
         return retString
 
     def _genKernel(self):
+        if self.dataflow == "CHW" and (self.kernel_h, self.kernel_w, self.stride, self.pad_h, self.pad_w) == (3, 3, 1, 1, 1):
+            return self._genKernel3x3s1()
         retString = ""
         # function name
         retString += self._genKernelDefine() + "\n{\n"
@@ -622,6 +624,81 @@ class depthwiseInplace:
         retString += """    }
 }\n"""
         return retString
+
+    def _genKernel3x3s1(self):
+        """3x3 / stride 1 / pad 1 on one channel plane. gcc's scalar version needed ~80 instructions per output
+        (spilling 12 inputs + 9 weights, re-reading multiplier/shift through the aliasing output pointer). Here one
+        32-bit load per input row gives 4 adjacent bytes; SXTB16 splits them into (c0,c2) and (c1,c3), and with the
+        weights packed as (w0,w2) each row costs 4 multiply-accumulates for 6 MACs and 2 outputs. The requant
+        constants are hoisted out of the loops."""
+        if self.fp_requantize:
+            req = ("({ q31_t r_ = (q31_t)((float)(v) * scale); r_ += output_offset; "
+                   "r_ = TN_MAX(r_, activation_min); TN_MIN(r_, activation_max); })")
+            consts = "    const float scale = *scales;\n"
+        else:
+            req = ("({ q31_t r_ = arm_nn_divide_by_power_of_two("
+                   "arm_nn_doubling_high_mult_no_sat(((v) + post) * lsm, mult), rs); "
+                   "r_ += output_offset; r_ = TN_MAX(r_, activation_min); TN_MIN(r_, activation_max); })")
+            consts = """    const q31_t post = biasR[0];
+    const q31_t mult = *multiplier;
+    const q31_t lsm = 1 << LEFT_SHIFT(*shift);
+    const q31_t rs = RIGHT_SHIFT(*shift);
+"""
+        body = f"""
+{self._genKernelDefine()}
+{{
+    /* 3x3, stride 1, pad 1 -- see depthwiseTemplate._genKernel3x3s1 */
+    #define DW_REQ(v) {req}
+    const q31_t init = bias[0] + biasR[0];
+{consts}    const q31_t w0 = ksrc[0], w1 = ksrc[1], w2 = ksrc[2], w3 = ksrc[3], w4 = ksrc[4];
+    const q31_t w5 = ksrc[5], w6 = ksrc[6], w7 = ksrc[7], w8 = ksrc[8];
+    const q31_t wa0 = __PKHBT(w0, w2, 16), wa1 = __PKHBT(w3, w5, 16), wa2 = __PKHBT(w6, w8, 16);
+    const int32_t row_w = column_x + 2;
+    const int32_t half = output_x / 2;
+    int32_t i, j;
+
+    for (i = 0; i < output_y; i++) {{
+        const q7_t *r0 = cols_8b_iterptr;
+        const q7_t *r1 = r0 + row_w;
+        const q7_t *r2 = r1 + row_w;
+        q7_t *o = output + (int32_t)i * output_x * channel_offset;
+
+        for (j = 0; j < half; j++) {{
+            q31_t x, pe, po;
+            q31_t sum0 = init, sum1 = init;
+
+            x = arm_nn_read_q7x4(r0); r0 += 2;
+            pe = __SXTB16(x); po = __SXTB16(__ROR(x, 8));
+            sum0 = __SMLAD(pe, wa0, sum0) + (int16_t)po * w1;
+            sum1 = __SMLAD(po, wa0, sum1) + (pe >> 16) * w1;
+
+            x = arm_nn_read_q7x4(r1); r1 += 2;
+            pe = __SXTB16(x); po = __SXTB16(__ROR(x, 8));
+            sum0 = __SMLAD(pe, wa1, sum0) + (int16_t)po * w4;
+            sum1 = __SMLAD(po, wa1, sum1) + (pe >> 16) * w4;
+
+            x = arm_nn_read_q7x4(r2); r2 += 2;
+            pe = __SXTB16(x); po = __SXTB16(__ROR(x, 8));
+            sum0 = __SMLAD(pe, wa2, sum0) + (int16_t)po * w7;
+            sum1 = __SMLAD(po, wa2, sum1) + (pe >> 16) * w7;
+
+            o[0] = (q7_t)DW_REQ(sum0);
+            o[channel_offset] = (q7_t)DW_REQ(sum1);
+            o += 2 * channel_offset;
+        }}
+        if (output_x & 1) {{
+            q31_t sum = init;
+            sum += r0[0] * w0 + r0[1] * w1 + r0[2] * w2;
+            sum += r1[0] * w3 + r1[1] * w4 + r1[2] * w5;
+            sum += r2[0] * w6 + r2[1] * w7 + r2[2] * w8;
+            o[0] = (q7_t)DW_REQ(sum);
+        }}
+        cols_8b_iterptr += row_w;
+    }}
+    #undef DW_REQ
+}}
+"""
+        return body
 
     def _genKernelCWH(self):
         retString = ""
