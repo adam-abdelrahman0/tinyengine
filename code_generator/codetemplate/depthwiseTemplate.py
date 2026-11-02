@@ -529,7 +529,38 @@ class depthwiseInplace:
             return self._genKernel3x3s1()
         retString = ""
         # function name
-        retString += self._genKernelDefine() + "\n{\n"
+        define = self._genKernelDefine()
+        name = self._getKernelName()
+        dispatch = ""
+        if self.fp_requantize:
+            retString += define + "\n{\n"
+        else:
+            # int requantize: `fast` (every shift <= 0, int8 clamp) picks a right shift + one SSAT, as in _genKernel3x3s1
+            args = define[define.index("(") + 1:define.rindex(")")]
+            retString += ("static inline __attribute__((always_inline)) void " + name + "_body(" + args
+                          + ", const int fast)\n{\n")
+            retString += (
+                "    const q31_t post = biasR[0];\n"
+                "    const q31_t mult = *multiplier;\n"
+                "    const q31_t lsm = 1 << LEFT_SHIFT(*shift);\n"
+                "    const q31_t rs = RIGHT_SHIFT(*shift);\n"
+                "    const q31_t rhalf = (q31_t)(((uint32_t)1 << rs) >> 1);\n"
+                "    #define DW_REQ(v) (fast ? ({ q31_t acc_ = (v) + post; "
+                "q31_t hi_ = (q31_t)((((q63_t)acc_ * mult) + (1 << 30)) >> 31); "
+                "q31_t r_ = rs ? (hi_ + rhalf + (hi_ >> 31)) >> rs : hi_; __SSAT(r_ + output_offset, 8); }) "
+                ": ({ q31_t r_ = arm_nn_divide_by_power_of_two("
+                "arm_nn_doubling_high_mult_no_sat(((v) + post) * lsm, mult), rs); "
+                "r_ += output_offset; r_ = TN_MAX(r_, activation_min); TN_MIN(r_, activation_max); }))\n"
+            )
+            names = ", ".join(a.split()[-1].lstrip("*") for a in args.replace("\n", " ").split(","))
+            dispatch = (
+                "\n" + define + "\n{\n"
+                "    if (activation_min == -128 && activation_max == 127 && *shift <= 0) {\n"
+                "        " + name + "_body(" + names + ", 1);\n"
+                "    } else {\n"
+                "        " + name + "_body(" + names + ", 0);\n"
+                "    }\n}\n"
+            )
         retString += "    #define STRIDE " + str(self.stride) + "\n"
         retString += "    int i, j;\n"
 
@@ -569,17 +600,8 @@ class depthwiseInplace:
         else:
             retString += """
             /* requantize */
-            sum0 = arm_nn_requantize(sum0 + biasR[0], *multiplier, *shift);
-            sum0 += output_offset;
-            sum0 = TN_MAX(sum0, activation_min);
-            sum0 = TN_MIN(sum0, activation_max);
-            output[(i * output_x + j * 2) * channel_offset] = sum0;
-
-            sum1 = arm_nn_requantize(sum1 + biasR[0], *multiplier, *shift);
-            sum1 += output_offset;
-            sum1 = TN_MAX(sum1, activation_min);
-            sum1 = TN_MIN(sum1, activation_max);
-            output[(i * output_x + (j * 2 + 1)) * channel_offset] = sum1;
+            output[(i * output_x + j * 2) * channel_offset] = DW_REQ(sum0);
+            output[(i * output_x + (j * 2 + 1)) * channel_offset] = DW_REQ(sum1);
 
             cols_8b_iterptr += STRIDE * 2;
         }
@@ -605,11 +627,7 @@ class depthwiseInplace:
         """
         else:
             retString += """
-            sum = arm_nn_requantize(sum + biasR[0], *multiplier, *shift);
-            sum += output_offset;
-            sum = TN_MAX(sum, activation_min);
-            sum = TN_MIN(sum, activation_max);
-            output[(i * output_x + output_x - 1) * channel_offset] = sum;
+            output[(i * output_x + output_x - 1) * channel_offset] = DW_REQ(sum);
 
             cols_8b_iterptr += STRIDE;
         }
@@ -622,7 +640,10 @@ class depthwiseInplace:
 
         # end of function
         retString += """    }
-}\n"""
+"""
+        if not self.fp_requantize:
+            retString += "    #undef DW_REQ\n"
+        retString += "}\n" + dispatch
         return retString
 
     def _genKernel3x3s1(self):
@@ -636,16 +657,41 @@ class depthwiseInplace:
                    "r_ = TN_MAX(r_, activation_min); TN_MIN(r_, activation_max); })")
             consts = "    const float scale = *scales;\n"
         else:
-            req = ("({ q31_t r_ = arm_nn_divide_by_power_of_two("
+            # fast: every shift <= 0 and the clamp is the int8 range, so the requantize is a right shift and the clamp one
+            # SSAT (same result as the generic line, about 14 instructions fewer). `fast` is a constant in each copy.
+            req = ("(fast ? ({ q31_t acc_ = (v) + post; "
+                   "q31_t hi_ = (q31_t)((((q63_t)acc_ * mult) + (1 << 30)) >> 31); "
+                   "q31_t r_ = rs ? (hi_ + rhalf + (hi_ >> 31)) >> rs : hi_; __SSAT(r_ + output_offset, 8); }) "
+                   ": ({ q31_t r_ = arm_nn_divide_by_power_of_two("
                    "arm_nn_doubling_high_mult_no_sat(((v) + post) * lsm, mult), rs); "
-                   "r_ += output_offset; r_ = TN_MAX(r_, activation_min); TN_MIN(r_, activation_max); })")
+                   "r_ += output_offset; r_ = TN_MAX(r_, activation_min); TN_MIN(r_, activation_max); }))")
             consts = """    const q31_t post = biasR[0];
     const q31_t mult = *multiplier;
     const q31_t lsm = 1 << LEFT_SHIFT(*shift);
     const q31_t rs = RIGHT_SHIFT(*shift);
+    const q31_t rhalf = (q31_t)(((uint32_t)1 << rs) >> 1);
+"""
+        define = self._genKernelDefine()
+        name = self._getKernelName()
+        if self.fp_requantize:
+            head, dispatch = define, ""
+        else:
+            args = define[define.index("(") + 1:define.rindex(")")]
+            head = ("static inline __attribute__((always_inline)) void " + name + "_body(" + args
+                    + ", const int fast)")
+            names = ", ".join(a.split()[-1].lstrip("*") for a in args.replace("\n", " ").split(","))
+            dispatch = f"""
+{define}
+{{
+    if (activation_min == -128 && activation_max == 127 && *shift <= 0) {{
+        {name}_body({names}, 1);
+    }} else {{
+        {name}_body({names}, 0);
+    }}
+}}
 """
         body = f"""
-{self._genKernelDefine()}
+{head}
 {{
     /* 3x3, stride 1, pad 1 -- see depthwiseTemplate._genKernel3x3s1 */
     #define DW_REQ(v) {req}
@@ -697,7 +743,7 @@ class depthwiseInplace:
     }}
     #undef DW_REQ
 }}
-"""
+{dispatch}"""
         return body
 
     def _genKernelCWH(self):
