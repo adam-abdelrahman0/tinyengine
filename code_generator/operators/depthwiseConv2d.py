@@ -1,5 +1,6 @@
 import warnings
 
+from ..codetemplate.depthwiseTemplate import dw_block
 from ..constant import USE_BIT_MASK, USE_TTE_INT8
 from .basic_utils import basicOperator, deep_copy_dicts, isweightstr, overwrite_dicts
 
@@ -115,7 +116,10 @@ class DepthwiseConv2d(basicOperator):
     def get_sbuf_size(self) -> int:
         p = self.params
         if self.USE_INPLACE:
-            return 2 * (p["input_h"] + 2 * p["padding"]) * (p["input_w"] + 2 * p["padding"])  # 2 x resolution
+            plane = (p["input_h"] + 2 * p["padding"]) * (p["input_w"] + 2 * p["padding"])
+            if p.get("is_patch") or p["kernel_h"] != p["kernel_w"]:
+                return 2 * plane  # 2 x resolution; patchpadding_* and CWH kernels still work one channel at a time
+            return max(2, dw_block(plane, p["input_c"])) * plane  # depthwiseTemplate's blocked CHW kernel
         else:
             return 2 * p["kernel_h"] * p["kernel_w"] * p["input_c"]  # 16 bit
 

@@ -17,6 +17,23 @@
 # ----------------------------------------------------------------------
 
 
+import os
+
+# In-place CHW depthwise kernels gather several channels per pass over the HWC tensor (see
+# _genBlockedBody). DW_SCRATCH_BYTES caps the scratch they may use; DW_MAX_BLK is one 32-byte D-cache line
+# of channels. dw_block() is mirrored in the generated C, and operators/depthwiseConv2d.py uses it to size sbuf.
+DW_SCRATCH_BYTES = int(os.environ.get("TE_DW_SCRATCH", 53248))
+DW_MAX_BLK = 32
+
+
+def dw_block(plane, channels):
+    """Channels handled per pass: as many planes as fit in DW_SCRATCH_BYTES, a multiple of 4 once >= 4."""
+    blk = min(DW_SCRATCH_BYTES // plane, DW_MAX_BLK, channels)
+    if blk >= 4:
+        blk -= blk % 4
+    return max(blk, 1)
+
+
 class depthwiseInplace:
     def __init__(
         self,
@@ -45,13 +62,9 @@ class depthwiseInplace:
         retString += self._genKernelDefine() + ";\n"
         retString += self.genFuncDefine() + "\n{\n"
         if self.dataflow == "CHW":
-            retString += self._genBufferInitialization()
+            retString += self._genBlockedBody()
         elif self.dataflow == "CWH":
             retString += self._genBufferInitializationCWH()
-
-        if self.dataflow == "CHW":
-            retString += self._genInplaceKernel()
-        elif self.dataflow == "CWH":
             retString += self._genInplaceKernelCWH()
 
         retString += "    return STATE_SUCCESS;"
@@ -181,60 +194,15 @@ class depthwiseInplace:
  * Author: wmchen@mit.edu
  * -------------------------------------------------------------------- */
 #include "tinyengine_function.h"
-#include "arm_nnsupportfunctions.h"\n"""
+#include "arm_nnsupportfunctions.h"
+#define DW_SCRATCH_BYTES """
+            + str(DW_SCRATCH_BYTES)
+            + """
+#define DW_MAX_BLK """
+            + str(DW_MAX_BLK)
+            + "\n"
         )
 
-        return retString
-
-    def _genBufferInitialization(self):
-        retString = (
-            """
-    uint16_t c,i,j;
-    q7_t *cols_8b_start = (q7_t *)runtime_buf;
-    q7_t* cols_8b = (q7_t* )cols_8b_start;
-
-    //Set padding value
-    q7_t PAD8 = pad_value;
-    /* setup the padding regions for Im2col buffers */
-    //top region: 8bit x (input_x + pad_w * 2) x pad_h: unroll by pad value
-    for(i = 0; i < input_x + """
-            + str(self.pad_w * 2)
-            + """; i++){"""
-        )
-        for i in range(self.pad_h):
-            retString += """
-        *cols_8b++ = PAD8;"""
-        retString += """
-    }
-
-    //middle regions: left and right regions
-    for(i = 0; i < input_y; i++){"""
-        for i in range(self.pad_w):
-            retString += """
-        *cols_8b++ = PAD8;//left"""
-        retString += """
-        cols_8b += input_x; //skip middle"""
-        for i in range(self.pad_w):
-            retString += """
-        *cols_8b++ = PAD8;//right"""
-        retString += (
-            """
-    }
-
-    //bottom region: 8bit x (input_x + pad_w * 2) x pad_h: unroll by pad value
-    for(i = 0; i < input_x + """
-            + str(self.pad_w * 2)
-            + """; i++){"""
-        )
-        for i in range(self.pad_h):
-            retString += """
-        *cols_8b++ = PAD8;"""
-        retString += """
-    }
-
-    const q7_t *src;
-    const q7_t *ksrc = kernel;
-"""
         return retString
 
     def _genBufferInitializationCWH(self):
@@ -328,73 +296,90 @@ class depthwiseInplace:
 
         return retString
 
-    def _genInplaceKernel(self):
-        retString = ""
-        retString += """
-    for (c = 0; c < input_ch; c++){"""
-        retString += self._genFixedLoadHWC2CHW()
-        retString += self._assignInplaceOut(2, "output")
-        retString += self._genHandle1CH(2, "input_ch")
-        retString += """
-    }\n"""
-        return retString
+    def _genBlockedBody(self):
+        """Process dw_block() channels per pass: gather them from the HWC tensor in one sweep, run the per-plane
+        kernel on each (its output is compacted back into the plane, which is safe because a write always lands
+        behind every later read), then scatter all planes back in one sweep. The per-channel version re-walked
+        the whole tensor with stride input_ch once per channel, missing the D-cache each time."""
+        ph, pw = self.pad_h, self.pad_w
+        kname = self._getKernelName()
+        if self.fp_requantize:
+            call = kname + "(output_y, output_x, bias++, biasR++, ksrc, scales++, pl, output_offset," \
+                + "output_activation_min, output_activation_max, pl, input_x, 1);"
+        else:
+            call = kname + "(output_y, output_x, bias++, biasR++, ksrc, output_mult++, output_shift++, pl," \
+                + "output_offset, output_activation_min, output_activation_max, pl, input_x, 1);"
+        pad_rows = "".join("\n            *cols_8b++ = PAD8;" for _ in range(ph))
+        pad_left = "".join("\n            *cols_8b++ = PAD8;//left" for _ in range(pw))
+        pad_right = "".join("\n            *cols_8b++ = PAD8;//right" for _ in range(pw))
+        return f"""
+    uint16_t c, i, j;
+    uint32_t b, nb;
+    const uint32_t row_w = input_x + {pw * 2};
+    const uint32_t plane = (uint32_t)(input_y + {ph * 2}) * row_w;
+    /* same rule as depthwiseTemplate.dw_block(), which sizes sbuf */
+    uint32_t blk = DW_SCRATCH_BYTES / plane;
+    if (blk > DW_MAX_BLK) blk = DW_MAX_BLK;
+    if (blk > input_ch) blk = input_ch;
+    if (blk >= 4) blk -= blk % 4;
+    if (blk == 0) blk = 1;
+    const uint32_t npix = (uint32_t)output_y * output_x;
+    q7_t *cols_8b_start = (q7_t *)runtime_buf;
+    q7_t *gp[DW_MAX_BLK];
+    const q7_t PAD8 = pad_value;
+    const q7_t *ksrc = kernel;
 
-    def _genFixedLoadHWC2CHW(self):
-        retString = (
-            """
-        cols_8b = (q7_t*)(cols_8b_start + """
-            + str(self.pad_h)
-            + """ * (input_x) + """
-            + str(self.pad_h * self.pad_w * 2)
-            + """); //skip """
-            + str(self.pad_h)
-            + """ rows
-        src = input;
-        for(i = 0; i < input_y; i++){
-            cols_8b += """
-            + str(self.pad_w)
-            + """;//skip front
-            for(j = 0; j < input_x; j++){
-                *cols_8b++ = *src;// + input_offset;
+    for (c = 0; c < input_ch; c += blk) {{
+        nb = input_ch - c;
+        if (nb > blk) nb = blk;
+
+        /* zero-point border of each plane (the compacted outputs of the previous block overwrote it) */
+        for (b = 0; b < nb; b++) {{
+            q7_t *cols_8b = cols_8b_start + b * plane;
+            for (i = 0; i < input_x + {pw * 2}; i++) {{{pad_rows}
+            }}
+            for (i = 0; i < input_y; i++) {{{pad_left}
+                cols_8b += input_x; //skip middle{pad_right}
+            }}
+            for (i = 0; i < input_x + {pw * 2}; i++) {{{pad_rows}
+            }}
+        }}
+
+        /* gather: one pass over the tensor, nb adjacent channels per pixel */
+        for (b = 0; b < nb; b++) gp[b] = cols_8b_start + b * plane + {ph} * row_w + {pw};
+        const q7_t *src = input;
+        for (i = 0; i < input_y; i++) {{
+            for (j = 0; j < input_x; j++) {{
+                for (b = 0; b < nb; b++) gp[b][j] = src[b];
                 src += input_ch;
-            }
-            cols_8b += """
-            + str(self.pad_w)
-            + """;//skip end
-        }\n"""
-        )
+            }}
+            for (b = 0; b < nb; b++) gp[b] += row_w;
+        }}
 
-        return retString
+        /* compute: output lands compacted at the start of each plane */
+        for (b = 0; b < nb; b++) {{
+            q7_t *pl = cols_8b_start + b * plane;
+            {call}
+            ksrc += {self.kernel_h * self.kernel_w};
+        }}
+
+        /* scatter: one pass over the output tensor */
+        for (b = 0; b < nb; b++) gp[b] = cols_8b_start + b * plane;
+        q7_t *dst = output;
+        for (uint32_t p = 0; p < npix; p++) {{
+            for (b = 0; b < nb; b++) dst[b] = gp[b][p];
+            dst += input_ch;
+        }}
+        input += nb;
+        output += nb;
+    }}
+"""
 
     def _genEndStr(self):
         return "\n}"
 
     def _assignInplaceOut(self, pre_indent, out_str):
         return "    " * pre_indent + "q7_t *inplace_out = " + out_str + ";\n"
-
-    def _genHandle1CH(self, pre_indent, out_offset_str):
-        if self.fp_requantize:
-            retString = (
-                "    " * pre_indent
-                + self._getKernelName()
-                + "(output_y, output_x, bias++, biasR++, ksrc, scales++, inplace_out, output_offset,"
-                + "output_activation_min, output_activation_max,cols_8b_start, input_x, "
-                + out_offset_str
-                + ");\n"
-            )
-        else:
-            retString = (
-                "    " * pre_indent
-                + self._getKernelName()
-                + "(output_y, output_x, bias++, biasR++, ksrc, output_mult++, output_shift++, inplace_out,"
-                + "output_offset,output_activation_min, output_activation_max,cols_8b_start, input_x, "
-                + out_offset_str
-                + ");\n"
-            )
-        retString += "    " * pre_indent + "ksrc += " + str(self.kernel_h * self.kernel_w) + ";\n"
-        retString += "    " * pre_indent + "input++;\n"
-        retString += "    " * pre_indent + "output++;"
-        return retString
 
     def _genHandle1CH_CWH(self, pre_indent, out_offset_str):
         if self.fp_requantize:
