@@ -216,6 +216,19 @@ tinyengine_status tte_sigmoid_fpreq(int size, const int8_t *input_data, const fl
                                      const float input_zero, const float output_scale, const float zero_y,
                                      int8_t *output_data);
 
+// arm_nn_mat_mult_kernel_s8_s16_reordered with a cheaper epilogue (SSAT, right-shift-only requantize); only valid when
+// te_s8_fast_ok() (te_requant.h) holds for the layer, see te_mat_mult_s8.c
+q7_t *te_mat_mult_kernel_s8_s16_reordered_s8(const q7_t *input_a, const q15_t *input_b, const uint16_t output_ch,
+                                              const int32_t *out_shift, const int32_t *out_mult, const int32_t out_offset,
+                                              const uint16_t num_col_a, const int32_t *const output_bias, q7_t *out_0);
+
+// stem micro-kernel with the cheaper epilogue, same signature as arm_nn_mat_mult_kernel3_input3_s8_s16 (te_requant.h)
+q7_t *arm_nn_mat_mult_kernel3_input3_s8_s16_fast(const q7_t *input_a, const q15_t *input_b, const uint16_t output_ch,
+                                                  const int32_t *out_shift, const int32_t *out_mult, const int32_t out_offset,
+                                                  const int16_t activation_min, const int16_t activation_max,
+                                                  const uint16_t num_col_a, const int32_t *const output_bias, q7_t *out_0,
+                                                  q15_t *kbuf);
+
 // fused 1x1 conv + StarBlockV self-gate square: relu6(conv(x))^2 in one
 // pass instead of conv-then-mul_fpreq_inplace, see convolve_1x1_s8_selfgate.c
 tinyengine_status convolve_1x1_s8_selfgate(

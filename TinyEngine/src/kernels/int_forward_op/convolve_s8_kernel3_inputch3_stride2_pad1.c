@@ -21,6 +21,7 @@
 #include "arm_nnsupportfunctions.h"
 #include "img2col_element.h"
 #include "tinyengine_function.h"
+#include "te_requant.h"
 
 tinyengine_status convolve_s8_kernel3_inputch3_stride2_pad1(const q7_t *input, const uint16_t input_x, const uint16_t input_y,
 		const uint16_t input_ch, const q7_t *kernel, const int32_t *bias,
@@ -32,6 +33,7 @@ tinyengine_status convolve_s8_kernel3_inputch3_stride2_pad1(const q7_t *input, c
 		const uint16_t output_ch, q15_t *runtime_buf, q15_t *kbuf, q7_t pad_value) {
 	const int kernel_y = 3;
 	const int kernel_x = 3;
+	const int fast = te_s8_fast_ok(output_shift, output_ch, output_activation_min, output_activation_max);
 
 	int16_t i_out_y, i_out_x, i_ker_y, i_ker_x;
 
@@ -224,7 +226,7 @@ tinyengine_status convolve_s8_kernel3_inputch3_stride2_pad1(const q7_t *input, c
 			/* Computation is filed for every 2 columns */
 			if (two_column_buf == runtime_buf + 2 * 27) {
 
-				out = arm_nn_mat_mult_kernel3_input3_s8_s16(kernel,
+				out = (fast ? arm_nn_mat_mult_kernel3_input3_s8_s16_fast : arm_nn_mat_mult_kernel3_input3_s8_s16)(kernel,
 						runtime_buf, output_ch, output_shift, output_mult,
 						output_offset, output_activation_min, output_activation_max,
 						input_ch * kernel_y * kernel_x, bias, out, kbuf);

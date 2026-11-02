@@ -1,3 +1,4 @@
+import os
 import warnings
 
 from ..constant import USE_BIT_MASK, USE_TTE_INT8
@@ -251,7 +252,9 @@ class Conv2d(basicOperator):
                     else:
                         function_name = "convolve_1x1_s8_oddch"
                 else:
-                    if use_aggressive_unroll and params["input_c"] in [8, 16, 24, 48] and not params["need_Bmask"]:
+                    # TE_NO_CHN=1: use the generic convolve_1x1_s8 (SSAT epilogue) instead of the unrolled chN kernels
+                    if (use_aggressive_unroll and params["input_c"] in [8, 16, 24, 48] and not params["need_Bmask"]
+                            and not os.environ.get("TE_NO_CHN")):
                         function_name = f"convolve_1x1_s8_ch{str(params['input_c'])}"
                     else:
                         if (

@@ -18,6 +18,7 @@
 
 #include "arm_nnfunctions.h"
 #include "img2col_element.h"
+#include "te_requant.h"
 #include "tinyengine_function.h"
 
 #define DIM_KER_X (1U)
@@ -43,6 +44,8 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x,
 	q7_t *out = output;
 	const int32_t num_elements = output_x * output_y;
 	const int channel_div4 = (input_ch >> 2);
+	/* right-shift-only requantize + SSAT clamp when the layer allows it (see te_requant.h) */
+	const int fast = te_s8_fast_ok(output_shift, output_ch, out_activation_min, out_activation_max);
 
 	const int16_t inoff16 = input_offset;
 	q31_t offset_q15x2 = __PKHBT(inoff16, inoff16, 16);
@@ -66,11 +69,18 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x,
 			cnt--;
 		}
 
-		out = arm_nn_mat_mult_kernel_s8_s16_reordered(kernel,
-				two_column_buffer, output_ch, output_shift, output_mult,
-				(q7_t) out_offset, out_activation_min,
-				out_activation_max, input_ch * DIM_KER_Y * DIM_KER_X,
-				bias, out);
+		if (fast) {
+			out = te_mat_mult_kernel_s8_s16_reordered_s8(kernel,
+					two_column_buffer, output_ch, output_shift, output_mult,
+					(q7_t) out_offset, input_ch * DIM_KER_Y * DIM_KER_X,
+					bias, out);
+		} else {
+			out = arm_nn_mat_mult_kernel_s8_s16_reordered(kernel,
+					two_column_buffer, output_ch, output_shift, output_mult,
+					(q7_t) out_offset, out_activation_min,
+					out_activation_max, input_ch * DIM_KER_Y * DIM_KER_X,
+					bias, out);
+		}
 	}
 
 	/* check if there is an odd column left-over for computation */
