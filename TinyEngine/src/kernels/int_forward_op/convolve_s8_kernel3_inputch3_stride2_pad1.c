@@ -226,10 +226,17 @@ tinyengine_status convolve_s8_kernel3_inputch3_stride2_pad1(const q7_t *input, c
 			/* Computation is filed for every 2 columns */
 			if (two_column_buf == runtime_buf + 2 * 27) {
 
-				out = (fast ? arm_nn_mat_mult_kernel3_input3_s8_s16_fast : arm_nn_mat_mult_kernel3_input3_s8_s16)(kernel,
-						runtime_buf, output_ch, output_shift, output_mult,
-						output_offset, output_activation_min, output_activation_max,
-						input_ch * kernel_y * kernel_x, bias, out, kbuf);
+				if (fast) {
+					out = arm_nn_mat_mult_kernel3_input3_s8_s16_fast(kernel,
+							runtime_buf, output_ch, output_shift, output_mult,
+							output_offset, output_activation_min, output_activation_max,
+							input_ch * kernel_y * kernel_x, bias, out, kbuf);
+				} else {
+					out = arm_nn_mat_mult_kernel3_input3_s8_s16(kernel,
+							runtime_buf, output_ch, output_shift, output_mult,
+							output_offset, output_activation_min, output_activation_max,
+							input_ch * kernel_y * kernel_x, bias, out, kbuf);
+				}
 
 				/* counter reset */
 				two_column_buf = runtime_buf;
