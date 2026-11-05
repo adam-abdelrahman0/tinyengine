@@ -47,8 +47,15 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x,
 	const int channel_div4 = (input_ch >> 2);
 	/* right-shift-only requantize + SSAT clamp when the layer allows it (see te_requant.h) */
 	const int fast = te_s8_fast_ok(output_shift, output_ch, out_activation_min, out_activation_max);
+	int pairs_done = 0;
 #ifdef TE_DTCM
-	{
+	/* weights pre-expanded to q15 in DTCMRAM, once per block of rows; needs enough pixel pairs to repay the expansion */
+	if (fast && output_ch % 2 == 0 && num_elements >= 16 && te_conv1x1_xw_rows(input_ch) >= 2) {
+		te_conv1x1_pairs_xw(input, input_ch, kernel, bias, output_shift, output_mult, out_offset, input_offset, output,
+				num_elements / 2, output_ch, runtime_buf);
+		pairs_done = num_elements / 2;
+		out += (size_t) pairs_done * 2 * output_ch;
+	} else {
 		const size_t wbytes = (size_t) input_ch * output_ch;
 		if (wbytes > TE_WBUF_MIN && wbytes <= TE_WBUF_BYTES) {
 			memcpy(te_wbuf, kernel, wbytes);  /* tiny against the layer: weights are re-read for every pair of columns */
@@ -60,7 +67,7 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x,
 	const int16_t inoff16 = input_offset;
 	q31_t offset_q15x2 = __PKHBT(inoff16, inoff16, 16);
 
-	for (i_element = 0; i_element < num_elements / 2; i_element++) {
+	for (i_element = pairs_done; i_element < num_elements / 2; i_element++) {
 		/* Fill buffer for partial im2col - two columns at a time */
 		q7_t *src = &input[i_element * input_ch * 2];
 		q15_t *dst = two_column_buffer;

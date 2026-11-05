@@ -237,6 +237,12 @@ q7_t *arm_nn_mat_mult_kernel3_input3_s8_s16_fast(const q7_t *input_a, const q15_
 #endif
 #define TE_WBUF_MIN 4096
 extern q7_t te_wbuf[TE_WBUF_BYTES];
+/* te_conv1x1_xw.c: pixel pairs of a 1x1 conv with the weights pre-expanded to q15 in te_wbuf (see the file header) */
+int te_conv1x1_xw_rows(const uint16_t input_ch);
+void te_conv1x1_pairs_xw(const q7_t *input, const uint16_t input_ch, const q7_t *kernel, const int32_t *bias,
+                         const int32_t *output_shift, const int32_t *output_mult, const int32_t out_offset,
+                         const int32_t input_offset, q7_t *output, const int32_t num_pairs, const uint16_t output_ch,
+                         q15_t *runtime_buf);
 #endif
 
 // fused 1x1 conv + StarBlockV self-gate square: relu6(conv(x))^2 in one
