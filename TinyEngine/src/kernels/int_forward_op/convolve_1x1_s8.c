@@ -16,6 +16,7 @@
  * Target ISA:  ARMv7E-M
  * -------------------------------------------------------------------- */
 
+#include <string.h>
 #include "arm_nnfunctions.h"
 #include "img2col_element.h"
 #include "te_requant.h"
@@ -46,6 +47,15 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x,
 	const int channel_div4 = (input_ch >> 2);
 	/* right-shift-only requantize + SSAT clamp when the layer allows it (see te_requant.h) */
 	const int fast = te_s8_fast_ok(output_shift, output_ch, out_activation_min, out_activation_max);
+#ifdef TE_DTCM
+	{
+		const size_t wbytes = (size_t) input_ch * output_ch;
+		if (wbytes > TE_WBUF_MIN && wbytes <= TE_WBUF_BYTES) {
+			memcpy(te_wbuf, kernel, wbytes);  /* tiny against the layer: weights are re-read for every pair of columns */
+			kernel = te_wbuf;
+		}
+	}
+#endif
 
 	const int16_t inoff16 = input_offset;
 	q31_t offset_q15x2 = __PKHBT(inoff16, inoff16, 16);

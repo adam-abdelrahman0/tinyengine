@@ -703,15 +703,27 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
         kbuf_ptr = accumulate_ptr
         accumulate_ptr += int(schedule.buffers["kernel"])
 
-        buffer_len = max(int(schedule.peakmem), accumulate_ptr)
-        string = "static signed char buffer[" + str(buffer_len) + "] __attribute__((aligned(4)));\n"
-        fp.write(string)
-        string = "static signed char *buffer0 = &buffer[" + str(buffer0_ptr) + "];\n"
-        fp.write(string)
-        string = "static int16_t *sbuf = (int16_t *)&buffer[" + str(sbuf_ptr) + "];\n"
-        fp.write(string)
-        string = "static int16_t *kbuf = (int16_t *)&buffer[" + str(kbuf_ptr) + "];\n"
-        fp.write(string)
+        if os.environ.get("TE_DTCM"):
+            # TE_DTCM=1: sbuf/kbuf are the kernels' hot scratch (im2col columns, depthwise planes, stem weights). Put them in
+            # DTCMRAM (zero wait states at 480 MHz; the project's linker script leaves it unused, tinyengine_bench.py adds the
+            # .dtcm_bss section) instead of the end of `buffer` in RAM_D1, which then shrinks by their size.
+            buffer_len = int(schedule.buffers["input_output"])
+            fp.write("static signed char buffer[" + str(buffer_len) + "] __attribute__((aligned(4)));\n")
+            fp.write("static signed char *buffer0 = &buffer[" + str(buffer0_ptr) + "];\n")
+            for name, size in (("sbuf", int(schedule.buffers["im2col"])), ("kbuf", int(schedule.buffers["kernel"]))):
+                fp.write("static int16_t " + name + "_mem[" + str(max((size + 1) // 2, 1))
+                         + "] __attribute__((section(\".dtcm_bss\"), aligned(8)));\n")
+                fp.write("static int16_t *" + name + " = " + name + "_mem;\n")
+        else:
+            buffer_len = max(int(schedule.peakmem), accumulate_ptr)
+            string = "static signed char buffer[" + str(buffer_len) + "] __attribute__((aligned(4)));\n"
+            fp.write(string)
+            string = "static signed char *buffer0 = &buffer[" + str(buffer0_ptr) + "];\n"
+            fp.write(string)
+            string = "static int16_t *sbuf = (int16_t *)&buffer[" + str(sbuf_ptr) + "];\n"
+            fp.write(string)
+            string = "static int16_t *kbuf = (int16_t *)&buffer[" + str(kbuf_ptr) + "];\n"
+            fp.write(string)
         string = "const int SBuffer_size = " + str(int(schedule.buffers["im2col"])) + ";\n"
         fp.write(string)
         string = "const int KBuffer_size = " + str(int(schedule.buffers["kernel"])) + ";\n"

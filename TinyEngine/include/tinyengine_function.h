@@ -229,6 +229,16 @@ q7_t *arm_nn_mat_mult_kernel3_input3_s8_s16_fast(const q7_t *input_a, const q15_
                                                   const uint16_t num_col_a, const int32_t *const output_bias, q7_t *out_0,
                                                   q15_t *kbuf);
 
+#ifdef TE_DTCM
+/* Layers whose weights are bigger than TE_WBUF_MIN re-read them for every pair of columns and, past the 16 KB D-cache, stream them
+ * from flash each time. convolve_1x1_s8() keeps a copy of any that fit in te_wbuf (DTCMRAM: zero wait states at 480 MHz). */
+#ifndef TE_WBUF_BYTES
+#define TE_WBUF_BYTES 65536
+#endif
+#define TE_WBUF_MIN 4096
+extern q7_t te_wbuf[TE_WBUF_BYTES];
+#endif
+
 // fused 1x1 conv + StarBlockV self-gate square: relu6(conv(x))^2 in one
 // pass instead of conv-then-mul_fpreq_inplace, see convolve_1x1_s8_selfgate.c
 tinyengine_status convolve_1x1_s8_selfgate(
