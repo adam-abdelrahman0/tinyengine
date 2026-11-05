@@ -714,6 +714,8 @@ void invoke_1patch(uint16_t pad_t, uint16_t pad_b, uint16_t pad_l ,uint16_t pad_
                 fp.write("static int16_t " + name + "_mem[" + str(max((size + 1) // 2, 1))
                          + "] __attribute__((section(\".dtcm_bss\"), aligned(8)));\n")
                 fp.write("static int16_t *" + name + " = " + name + "_mem;\n")
+            # the 1x1 kernels borrow the idle tail of sbuf for pre-expanded weights (no extra RAM), see te_conv1x1_xw.c
+            fp.write("int16_t *const te_sbuf_base = sbuf_mem;\n")
         else:
             buffer_len = max(int(schedule.peakmem), accumulate_ptr)
             string = "static signed char buffer[" + str(buffer_len) + "] __attribute__((aligned(4)));\n"

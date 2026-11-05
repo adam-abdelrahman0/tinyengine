@@ -6,7 +6,7 @@
  *
  * The CMSIS-style micro-kernel (te_mat_mult_s8.c) re-expands every int8 weight word to two q15x2 words
  * (SXTB16, SXTB16 ROR 8) each time it is used, i.e. once per pair of pixels. Here a block of weight rows is
- * expanded once into te_wbuf (DTCMRAM) and reused for every pixel pair, so the inner loop is only loads and
+ * expanded once into a workspace (the idle tail of sbuf, DTCMRAM, no memory of its own) and reused for every pixel pair, so the inner loop is only loads and
  * SMLAD: per 4 input channels, 2 output channels x 2 pixels = 16 MACs = 4 weight words + 4 activation words
  * (two LDRD each) + 8 SMLAD, against 2 + 4 loads + 4 SXTB16 + 8 SMLAD before.
  *
@@ -26,10 +26,10 @@
 #include "te_requant.h"
 #include "tinyengine_function.h"
 
-/* number of weight rows (even, >= 2) whose expanded copy fits te_wbuf; 0 if even two rows do not */
-int te_conv1x1_xw_rows(const uint16_t input_ch)
+/* number of weight rows (even, >= 2) whose expanded copy fits the workspace; 0 if even two rows do not */
+int te_conv1x1_xw_rows(const size_t wspace_bytes, const uint16_t input_ch)
 {
-    return (int)((TE_WBUF_BYTES / (2U * input_ch)) & ~1U);
+    return (int)((wspace_bytes / (2U * input_ch)) & ~(size_t)1);
 }
 
 /* computes pixel pairs [0, num_pairs) of a 1x1 conv; pixel p reads input + p * input_ch, writes output + p * output_ch.
@@ -37,13 +37,13 @@ int te_conv1x1_xw_rows(const uint16_t input_ch)
 void te_conv1x1_pairs_xw(const q7_t *input, const uint16_t input_ch, const q7_t *kernel, const int32_t *bias,
                          const int32_t *output_shift, const int32_t *output_mult, const int32_t out_offset,
                          const int32_t input_offset, q7_t *output, const int32_t num_pairs, const uint16_t output_ch,
-                         q15_t *runtime_buf)
+                         q15_t *runtime_buf, q31_t *wspace, const size_t wspace_bytes)
 {
     const int groups = input_ch >> 2;
-    const int block_rows = te_conv1x1_xw_rows(input_ch);
+    const int block_rows = te_conv1x1_xw_rows(wspace_bytes, input_ch);
     const int16_t inoff16 = input_offset;
     const q31_t offset_q15x2 = __PKHBT(inoff16, inoff16, 16);
-    q31_t *const wblk = (q31_t *)te_wbuf;
+    q31_t *const wblk = wspace;
 
     for (int row0 = 0; row0 < output_ch; row0 += block_rows)
     {
@@ -97,7 +97,7 @@ void te_conv1x1_pairs_xw(const q7_t *input, const uint16_t input_ch, const q7_t 
                 const uint64_t *const b_end = b + 2 * groups;
                 q31_t acc00 = bias[r], acc01 = bias[r];
                 q31_t acc10 = bias[r + 1], acc11 = bias[r + 1];
-                /* 64-bit loads (te_wbuf and the scratch buffer are word aligned at least) so the compiler emits LDRD:
+                /* 64-bit loads (the workspace and the scratch buffer are 8-byte aligned) so the compiler emits LDRD:
                  * 4 loads + 8 SMLAD per group of 4 channels (groups >= 1: input_ch >= 4) */
                 do
                 {

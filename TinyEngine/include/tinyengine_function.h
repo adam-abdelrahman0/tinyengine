@@ -230,19 +230,17 @@ q7_t *arm_nn_mat_mult_kernel3_input3_s8_s16_fast(const q7_t *input_a, const q15_
                                                   q15_t *kbuf);
 
 #ifdef TE_DTCM
-/* Layers whose weights are bigger than TE_WBUF_MIN re-read them for every pair of columns and, past the 16 KB D-cache, stream them
- * from flash each time. convolve_1x1_s8() keeps a copy of any that fit in te_wbuf (DTCMRAM: zero wait states at 480 MHz). */
-#ifndef TE_WBUF_BYTES
-#define TE_WBUF_BYTES 65536
-#endif
+/* sbuf (the im2col / depthwise scratch, in DTCMRAM under TE_DTCM) is far bigger than a 1x1 conv needs of it (4 * input_ch bytes).
+ * convolve_1x1_s8() uses the rest, while it runs, as a weight workspace -- no memory of its own. Both symbols come from genModel.h. */
+extern const int SBuffer_size;
+extern int16_t *const te_sbuf_base;
 #define TE_WBUF_MIN 4096
-extern q7_t te_wbuf[TE_WBUF_BYTES];
-/* te_conv1x1_xw.c: pixel pairs of a 1x1 conv with the weights pre-expanded to q15 in te_wbuf (see the file header) */
-int te_conv1x1_xw_rows(const uint16_t input_ch);
+/* te_conv1x1_xw.c: pixel pairs of a 1x1 conv with the weights pre-expanded to q15 in the workspace (see the file header) */
+int te_conv1x1_xw_rows(const size_t wspace_bytes, const uint16_t input_ch);
 void te_conv1x1_pairs_xw(const q7_t *input, const uint16_t input_ch, const q7_t *kernel, const int32_t *bias,
                          const int32_t *output_shift, const int32_t *output_mult, const int32_t out_offset,
                          const int32_t input_offset, q7_t *output, const int32_t num_pairs, const uint16_t output_ch,
-                         q15_t *runtime_buf);
+                         q15_t *runtime_buf, q31_t *wspace, const size_t wspace_bytes);
 #endif
 
 // fused 1x1 conv + StarBlockV self-gate square: relu6(conv(x))^2 in one

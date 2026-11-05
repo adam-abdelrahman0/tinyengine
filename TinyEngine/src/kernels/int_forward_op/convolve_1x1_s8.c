@@ -53,19 +53,23 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x,
 	 * With several blocks every pixel's input is read once per block, which is only valid if the output does not overlap
 	 * the input: --pointwise-overwrite puts the output on top of the input, and that is safe only when each pair is read
 	 * and then written in order (one block). Overlapping multi-block layers take the path below. */
-	const int xw_rows = te_conv1x1_xw_rows(input_ch);
+	/* workspace: the part of sbuf after this layer's two im2col columns (4 * input_ch bytes), if runtime_buf is sbuf */
+	const size_t wspace_off = 4 * (size_t) input_ch;
+	const size_t wspace_bytes = (runtime_buf == te_sbuf_base && (size_t) SBuffer_size > wspace_off) ? ((size_t) SBuffer_size - wspace_off) & ~(size_t) 7 : 0;
+	q31_t *const wspace = (q31_t *) ((q7_t *) runtime_buf + wspace_off);
+	const int xw_rows = te_conv1x1_xw_rows(wspace_bytes, input_ch);
 	const uintptr_t in_lo = (uintptr_t) input, out_lo = (uintptr_t) output;
 	const int overlap = out_lo < in_lo + (size_t) num_elements * input_ch && in_lo < out_lo + (size_t) num_elements * output_ch;
 	if (fast && output_ch % 2 == 0 && num_elements >= 16 && xw_rows >= 2 && (xw_rows >= output_ch || !overlap)) {
 		te_conv1x1_pairs_xw(input, input_ch, kernel, bias, output_shift, output_mult, out_offset, input_offset, output,
-				num_elements / 2, output_ch, runtime_buf);
+				num_elements / 2, output_ch, runtime_buf, wspace, wspace_bytes);
 		pairs_done = num_elements / 2;
 		out += (size_t) pairs_done * 2 * output_ch;
 	} else {
 		const size_t wbytes = (size_t) input_ch * output_ch;
-		if (wbytes > TE_WBUF_MIN && wbytes <= TE_WBUF_BYTES) {
-			memcpy(te_wbuf, kernel, wbytes);  /* tiny against the layer: weights are re-read for every pair of columns */
-			kernel = te_wbuf;
+		if (wbytes > TE_WBUF_MIN && wbytes <= wspace_bytes) {
+			memcpy(wspace, kernel, wbytes);  /* tiny against the layer: weights are re-read for every pair of columns */
+			kernel = (const q7_t *) wspace;
 		}
 	}
 #endif
