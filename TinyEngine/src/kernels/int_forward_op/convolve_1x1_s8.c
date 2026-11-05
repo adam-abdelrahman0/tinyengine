@@ -49,8 +49,14 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x,
 	const int fast = te_s8_fast_ok(output_shift, output_ch, out_activation_min, out_activation_max);
 	int pairs_done = 0;
 #ifdef TE_DTCM
-	/* weights pre-expanded to q15 in DTCMRAM, once per block of rows; needs enough pixel pairs to repay the expansion */
-	if (fast && output_ch % 2 == 0 && num_elements >= 16 && te_conv1x1_xw_rows(input_ch) >= 2) {
+	/* weights pre-expanded to q15 in DTCMRAM, once per block of rows; needs enough pixel pairs to repay the expansion.
+	 * With several blocks every pixel's input is read once per block, which is only valid if the output does not overlap
+	 * the input: --pointwise-overwrite puts the output on top of the input, and that is safe only when each pair is read
+	 * and then written in order (one block). Overlapping multi-block layers take the path below. */
+	const int xw_rows = te_conv1x1_xw_rows(input_ch);
+	const uintptr_t in_lo = (uintptr_t) input, out_lo = (uintptr_t) output;
+	const int overlap = out_lo < in_lo + (size_t) num_elements * input_ch && in_lo < out_lo + (size_t) num_elements * output_ch;
+	if (fast && output_ch % 2 == 0 && num_elements >= 16 && xw_rows >= 2 && (xw_rows >= output_ch || !overlap)) {
 		te_conv1x1_pairs_xw(input, input_ch, kernel, bias, output_shift, output_mult, out_offset, input_offset, output,
 				num_elements / 2, output_ch, runtime_buf);
 		pairs_done = num_elements / 2;
