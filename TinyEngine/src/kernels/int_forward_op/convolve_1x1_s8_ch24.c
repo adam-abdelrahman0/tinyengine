@@ -102,7 +102,7 @@ tinyengine_status convolve_1x1_s8_ch24(const q7_t *input, const uint16_t input_x
 
 		preprocess_weights(kernel, prepacked_weight_buffer, output_ch, input_ch);
 
-		out = mat_mult_kernel_s8_s16_reordered_ch24(kernel,
+		out = mat_mult_kernel_s8_s16_preprocessed_ch24(prepacked_weight_buffer,
 				two_column_buffer, output_ch, output_shift, output_mult,
 				(q7_t) out_offset, out_activation_min,
 				out_activation_max, input_ch * DIM_KER_Y * DIM_KER_X,
