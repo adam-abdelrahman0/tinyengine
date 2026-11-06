@@ -24,6 +24,43 @@
 #define DIM_KER_X (1U)
 #define DIM_KER_Y (1U)
 
+q31_t prepacked_weight_buffer[5000];
+
+// Run once at startup:
+
+void preprocess_weights(
+	const q7_t *raw_weights,
+	q31_t *prepacked_weights,
+	uint16_t output_ch,
+	uint16_t num_col_a)
+{
+	q31_t *dest_ptr = prepacked_weights;
+
+// Process output channels in pairs (matching row_count = output_ch / 2)
+	for (uint16_t ch = 0; ch < output_ch; ch += 2)
+	{
+// Point to the start of Channel N and Channel N+1 in the raw weight matrix
+		const q7_t *row_n = raw_weights + ch * num_col_a;
+		const q7_t *row_n1 = raw_weights + (ch + 1) * num_col_a;
+
+// Iterate through columns in blocks of 4 (since read_and_pad reads 4 q7 bytes at a time)
+		for (uint16_t col = 0; col < num_col_a; col += 4)
+		{
+			q31_t a01, a02, a11, a12;
+
+		// 1. Process Channel N (reads 4 bytes, packs into two q31_t words: a01, a02)
+			row_n = read_and_pad_reordered(row_n, &a01, &a02);
+			*dest_ptr++ = a01;
+			*dest_ptr++ = a02;
+
+// 2. Process Channel N+1 (reads 4 bytes, packs into two q31_t words: a11, a12)
+			row_n1 = read_and_pad_reordered(row_n1, &a11, &a12);
+			*dest_ptr++ = a11;
+			*dest_ptr++ = a12;
+		}
+}
+}
+
 tinyengine_status convolve_1x1_s8_ch24(const q7_t *input, const uint16_t input_x,
 		const uint16_t input_y, const uint16_t input_ch, const q7_t *kernel,
 		const int32_t *bias, const int32_t *output_shift,
@@ -62,6 +99,8 @@ tinyengine_status convolve_1x1_s8_ch24(const q7_t *input, const uint16_t input_x
 			q7_q15_offset_reordered_ele(src, dst)
 			cnt--;
 		}
+
+		preprocess_weights(kernel, prepacked_weight_buffer, output_ch, input_ch);
 
 		out = mat_mult_kernel_s8_s16_reordered_ch24(kernel,
 				two_column_buffer, output_ch, output_shift, output_mult,

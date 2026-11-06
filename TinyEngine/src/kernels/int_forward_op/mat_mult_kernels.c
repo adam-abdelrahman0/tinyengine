@@ -19,6 +19,223 @@
 #include "arm_nnsupportfunctions.h"
 #include "tinyengine_lib.h"
 
+
+q7_t *mat_mult_kernel_s8_s16_preprocessed_ch24(const q31_t *input_a,
+                                             const q15_t *input_b,
+                                             const uint16_t output_ch,
+                                             const int32_t *out_shift,
+                                             const int32_t *out_mult,
+                                             const int32_t out_offset,
+                                             const int16_t activation_min,
+                                             const int16_t activation_max,
+                                             const uint16_t num_col_a,
+                                             const int32_t *const output_bias,
+                                             q7_t *out_0)
+{
+    /* set up the second output pointers */
+    q7_t *out_1 = out_0 + output_ch;
+    const int32_t *bias = output_bias;
+
+    uint16_t row_count = output_ch / 2;
+    const q31_t *ip_a = input_a;
+
+    /* this loop over pairs of rows in A */
+    while (row_count)
+    {
+        /* setup pointers for B */
+        const q15_t *ip_b0 = input_b;
+        const q15_t *ip_b1 = ip_b0 + num_col_a;
+
+        /* Init accumulator with bias for channel N and N + 1 */
+        q31_t ch_0_out_0 = *bias;
+        q31_t ch_0_out_1 = *bias++;
+        q31_t ch_1_out_0 = *bias;
+        q31_t ch_1_out_1 = *bias++;
+
+        q31_t a01, a02, a11, a12;
+        q31_t b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        q31_t b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        // ========================================================
+        // BLOCK 1: Columns 0 to 3
+        // ========================================================
+        a01 = *ip_a++;
+        a02 = *ip_a++;
+        a11 = *ip_a++;
+        a12 = *ip_a++;
+
+        ch_0_out_0 = __SMLAD(a01, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a01, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a11, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a11, b1, ch_1_out_1);
+
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        ch_0_out_0 = __SMLAD(a02, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a02, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a12, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a12, b1, ch_1_out_1);
+
+        // ========================================================
+        // BLOCK 2: Columns 4 to 7
+        // ========================================================
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        a01 = *ip_a++;
+        a02 = *ip_a++;
+        a11 = *ip_a++;
+        a12 = *ip_a++;
+
+        ch_0_out_0 = __SMLAD(a01, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a01, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a11, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a11, b1, ch_1_out_1);
+
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        ch_0_out_0 = __SMLAD(a02, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a02, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a12, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a12, b1, ch_1_out_1);
+
+        // ========================================================
+        // BLOCK 3: Columns 8 to 11
+        // ========================================================
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        a01 = *ip_a++;
+        a02 = *ip_a++;
+        a11 = *ip_a++;
+        a12 = *ip_a++;
+
+        ch_0_out_0 = __SMLAD(a01, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a01, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a11, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a11, b1, ch_1_out_1);
+
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        ch_0_out_0 = __SMLAD(a02, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a02, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a12, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a12, b1, ch_1_out_1);
+
+        // ========================================================
+        // BLOCK 4: Columns 12 to 15
+        // ========================================================
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        a01 = *ip_a++;
+        a02 = *ip_a++;
+        a11 = *ip_a++;
+        a12 = *ip_a++;
+
+        ch_0_out_0 = __SMLAD(a01, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a01, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a11, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a11, b1, ch_1_out_1);
+
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        ch_0_out_0 = __SMLAD(a02, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a02, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a12, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a12, b1, ch_1_out_1);
+
+        // ========================================================
+        // BLOCK 5: Columns 16 to 19
+        // ========================================================
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        a01 = *ip_a++;
+        a02 = *ip_a++;
+        a11 = *ip_a++;
+        a12 = *ip_a++;
+
+        ch_0_out_0 = __SMLAD(a01, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a01, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a11, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a11, b1, ch_1_out_1);
+
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        ch_0_out_0 = __SMLAD(a02, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a02, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a12, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a12, b1, ch_1_out_1);
+
+        // ========================================================
+        // BLOCK 6: Columns 20 to 23
+        // ========================================================
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        a01 = *ip_a++;
+        a02 = *ip_a++;
+        a11 = *ip_a++;
+        a12 = *ip_a++;
+
+        ch_0_out_0 = __SMLAD(a01, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a01, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a11, b0, ch_1_out_0);
+        b0 = arm_nn_read_q15x2_ia(&ip_b0);
+        ch_1_out_1 = __SMLAD(a11, b1, ch_1_out_1);
+
+        b1 = arm_nn_read_q15x2_ia(&ip_b1);
+
+        ch_0_out_0 = __SMLAD(a02, b0, ch_0_out_0);
+        ch_0_out_1 = __SMLAD(a02, b1, ch_0_out_1);
+        ch_1_out_0 = __SMLAD(a12, b0, ch_1_out_0);
+        ch_1_out_1 = __SMLAD(a12, b1, ch_1_out_1);
+
+        // ========================================================
+        // Requantization, Activation, and Store
+        // ========================================================
+        ch_0_out_0 = arm_nn_requantize(ch_0_out_0, *out_mult, *out_shift);
+        ch_0_out_0 += out_offset;
+        ch_0_out_0 = MAX(ch_0_out_0, activation_min);
+        ch_0_out_0 = MIN(ch_0_out_0, activation_max);
+        *out_0++ = (q7_t)ch_0_out_0;
+
+        ch_0_out_1 = arm_nn_requantize(ch_0_out_1, *out_mult, *out_shift);
+        ch_0_out_1 += out_offset;
+        ch_0_out_1 = MAX(ch_0_out_1, activation_min);
+        ch_0_out_1 = MIN(ch_0_out_1, activation_max);
+        *out_1++ = (q7_t)ch_0_out_1;
+        out_mult++;
+        out_shift++;
+
+        ch_1_out_0 = arm_nn_requantize(ch_1_out_0, *out_mult, *out_shift);
+        ch_1_out_0 += out_offset;
+        ch_1_out_0 = MAX(ch_1_out_0, activation_min);
+        ch_1_out_0 = MIN(ch_1_out_0, activation_max);
+        *out_0++ = (q7_t)ch_1_out_0;
+
+        ch_1_out_1 = arm_nn_requantize(ch_1_out_1, *out_mult, *out_shift);
+        ch_1_out_1 += out_offset;
+        ch_1_out_1 = MAX(ch_1_out_1, activation_min);
+        ch_1_out_1 = MIN(ch_1_out_1, activation_max);
+        *out_1++ = (q7_t)ch_1_out_1;
+        out_mult++;
+        out_shift++;
+
+        row_count--;
+    }
+
+    out_0 += output_ch;
+
+    /* return the new output pointer with offset */
+    return out_0;
+}
 /*
    * Matrix-multiplication function for convolution with uint8
    */
