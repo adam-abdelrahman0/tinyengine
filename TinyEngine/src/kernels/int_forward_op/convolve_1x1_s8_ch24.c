@@ -24,11 +24,10 @@
 #define DIM_KER_X (1U)
 #define DIM_KER_Y (1U)
 
-q31_t prepacked_weight_buffer[5000];
-
-// Run once at startup:
-
-void preprocess_weights(
+/* Widens the weights once per layer call (not per pixel pair): for each pair of output channels and each group of 4
+ * input channels, the four q15x2 words a01 a02 a11 a12 that mat_mult_kernel_s8_s16_preprocessed_ch24() consumes.
+ * Needs output_ch * num_col_a * 2 bytes (1536 for 32 x 24); the caller lends it the idle tail of sbuf. */
+static void preprocess_weights(
 	const q7_t *raw_weights,
 	q31_t *prepacked_weights,
 	uint16_t output_ch,
@@ -78,6 +77,21 @@ tinyengine_status convolve_1x1_s8_ch24(const q7_t *input, const uint16_t input_x
 	const int32_t num_elements = output_x * output_y;
 	const int channel_div4 = (input_ch >> 2);
 
+	/* pre-widened weights: the preprocessed kernel is unrolled for 24 input channels and needs an even output_ch. Its
+	 * workspace is the part of sbuf after this call's two im2col columns (4 * input_ch bytes), which nothing else uses
+	 * while the layer runs; without it (no TE_DTCM, or too small) the original kernel runs on the raw weights. */
+	int use_prepacked = 0;
+#ifdef TE_DTCM
+	const size_t wspace_off = 4 * (size_t) input_ch;
+	const size_t wspace_need = (size_t) output_ch * input_ch * 2;
+	q31_t *const prepacked = (q31_t *) ((q7_t *) runtime_buf + wspace_off);
+	if (input_ch == 24 && output_ch % 2 == 0 && runtime_buf == te_sbuf_base
+			&& (size_t) SBuffer_size >= wspace_off + wspace_need) {
+		preprocess_weights(kernel, prepacked, output_ch, input_ch);
+		use_prepacked = 1;
+	}
+#endif
+
 	const int16_t inoff16 = input_offset;
 	q31_t offset_q15x2 = __PKHBT(inoff16, inoff16, 16);
 
@@ -100,9 +114,17 @@ tinyengine_status convolve_1x1_s8_ch24(const q7_t *input, const uint16_t input_x
 			cnt--;
 		}
 
-		preprocess_weights(kernel, prepacked_weight_buffer, output_ch, input_ch);
-
-		out = mat_mult_kernel_s8_s16_preprocessed_ch24(prepacked_weight_buffer,
+#ifdef TE_DTCM
+		if (use_prepacked) {
+			out = mat_mult_kernel_s8_s16_preprocessed_ch24(prepacked,
+					two_column_buffer, output_ch, output_shift, output_mult,
+					(q7_t) out_offset, out_activation_min,
+					out_activation_max, input_ch * DIM_KER_Y * DIM_KER_X,
+					bias, out);
+			continue;
+		}
+#endif
+		out = mat_mult_kernel_s8_s16_reordered_ch24(kernel,
 				two_column_buffer, output_ch, output_shift, output_mult,
 				(q7_t) out_offset, out_activation_min,
 				out_activation_max, input_ch * DIM_KER_Y * DIM_KER_X,
