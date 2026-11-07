@@ -32,7 +32,7 @@
 #define MUL_BC_ELEM(x8, s8)                                                                      \
   ({ float xf = ((float)(x8) - input_zero) * input_scale;                                        \
      float sf = ((float)(s8) - scaler_zero) * scaler_scale;                                      \
-     int o = (int)round((xf * sf) / output_scale + zero_y);                                      \
+     int o = (int)roundf((xf * sf) / output_scale + zero_y);                                     \
      o = TN_MAX(o, -128);                                                                        \
      TN_MIN(o, 127); })
 

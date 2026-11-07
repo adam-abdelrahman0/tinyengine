@@ -26,7 +26,7 @@
 #define ADD_FPREQ_ELEM(a8, b8)                                                                     \
   ({ float fa = ((float)(a8) - input1_zero) * input1_scale;                                        \
      float fb = ((float)(b8) - input2_zero) * input2_scale;                                        \
-     int o = (int)round((fa + fb) / output_scale + zero_y); /* to align with tvm implementation */ \
+     int o = (int)roundf((fa + fb) / output_scale + zero_y); /* == round() of the float, single precision */\
      o = TN_MAX(o, -128);                                                                          \
      TN_MIN(o, 127); })
 
