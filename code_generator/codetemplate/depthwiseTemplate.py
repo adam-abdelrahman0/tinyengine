@@ -195,6 +195,30 @@ class depthwiseInplace:
  * -------------------------------------------------------------------- */
 #include "tinyengine_function.h"
 #include "arm_nnsupportfunctions.h"
+#include "te_requant.h"
+#include <string.h>
+/* high multiply of the requantize: smmulr(2 * acc, mult) == (acc * mult + 2^30) >> 31 for the small accumulators here */
+#ifdef TE_NO_SMMULR
+#define DW_HI(a, m) ((q31_t)((((q63_t)(a) * (m)) + (1 << 30)) >> 31))
+#else
+#define DW_HI(a, m) te_smmulr((a) * 2, (m))
+#endif
+/* 4x4 byte transpose: a..d each hold 4 bytes of one row; o0..o3 get the 4 columns. Used by the HWC<->CHW gather and
+ * scatter (4 pixels x 4 channels per call, 4 loads + 4 stores instead of 16 of each). UXTB16 splits even/odd bytes,
+ * PKHBT/PKHTB join the halfwords. TE_DW_NO_TRANSPOSE selects the byte-at-a-time loops (sweep). */
+static inline __attribute__((always_inline)) void dw_transpose4(q31_t a, q31_t b, q31_t c, q31_t d, q31_t *o0, q31_t *o1,
+                                                                 q31_t *o2, q31_t *o3)
+{
+    const q31_t t0 = __UXTB16(a) | (__UXTB16(b) << 8);                    /* a0 b0 a2 b2 */
+    const q31_t t1 = __UXTB16(__ROR(a, 8)) | (__UXTB16(__ROR(b, 8)) << 8); /* a1 b1 a3 b3 */
+    const q31_t u0 = __UXTB16(c) | (__UXTB16(d) << 8);                    /* c0 d0 c2 d2 */
+    const q31_t u1 = __UXTB16(__ROR(c, 8)) | (__UXTB16(__ROR(d, 8)) << 8); /* c1 d1 c3 d3 */
+    *o0 = __PKHBT(t0, u0, 16);                                             /* a0 b0 c0 d0 */
+    *o1 = __PKHBT(t1, u1, 16);                                             /* a1 b1 c1 d1 */
+    *o2 = __PKHTB(u0, t0, 16);                                             /* a2 b2 c2 d2 */
+    *o3 = __PKHTB(u1, t1, 16);                                             /* a3 b3 c3 d3 */
+}
+#define dw_st32(p, v) do { const q31_t v_ = (v); memcpy((p), &v_, 4); } while (0)
 #define DW_SCRATCH_BYTES """
             + str(DW_SCRATCH_BYTES)
             + """
@@ -346,6 +370,7 @@ class depthwiseInplace:
         }}
 
         /* gather: one pass over the tensor, nb adjacent channels per pixel */
+#ifdef TE_DW_NO_TRANSPOSE
         for (b = 0; b < nb; b++) gp[b] = cols_8b_start + b * plane + {ph} * row_w + {pw};
         const q7_t *src = input;
         for (i = 0; i < input_y; i++) {{
@@ -355,6 +380,39 @@ class depthwiseInplace:
             }}
             for (b = 0; b < nb; b++) gp[b] += row_w;
         }}
+#else
+        {{
+            const uint32_t nb4 = nb & ~3u;
+            q7_t *const pbase = cols_8b_start + {ph} * row_w + {pw};
+            const q7_t *src = input;
+            for (i = 0; i < input_y; i++) {{
+                q7_t *const rowp = pbase + (size_t)i * row_w;
+                for (j = 0; j + 4 <= input_x; j += 4) {{
+                    const q7_t *s = src + (size_t)j * input_ch;
+                    for (b = 0; b < nb4; b += 4) {{
+                        q31_t o0, o1, o2, o3;
+                        dw_transpose4(arm_nn_read_q7x4(s + b), arm_nn_read_q7x4(s + input_ch + b),
+                                      arm_nn_read_q7x4(s + 2 * (size_t)input_ch + b),
+                                      arm_nn_read_q7x4(s + 3 * (size_t)input_ch + b), &o0, &o1, &o2, &o3);
+                        q7_t *d = rowp + (size_t)b * plane + j;
+                        dw_st32(d, o0);
+                        dw_st32(d + plane, o1);
+                        dw_st32(d + 2 * (size_t)plane, o2);
+                        dw_st32(d + 3 * (size_t)plane, o3);
+                    }}
+                    for (b = nb4; b < nb; b++) {{
+                        q7_t *d = rowp + (size_t)b * plane + j;
+                        d[0] = s[b]; d[1] = s[input_ch + b]; d[2] = s[2 * (size_t)input_ch + b]; d[3] = s[3 * (size_t)input_ch + b];
+                    }}
+                }}
+                for (; j < input_x; j++) {{
+                    const q7_t *s = src + (size_t)j * input_ch;
+                    for (b = 0; b < nb; b++) rowp[(size_t)b * plane + j] = s[b];
+                }}
+                src += (size_t)input_x * input_ch;
+            }}
+        }}
+#endif
 
         /* compute: output lands compacted at the start of each plane */
         for (b = 0; b < nb; b++) {{
@@ -364,12 +422,40 @@ class depthwiseInplace:
         }}
 
         /* scatter: one pass over the output tensor */
+#ifdef TE_DW_NO_TRANSPOSE
         for (b = 0; b < nb; b++) gp[b] = cols_8b_start + b * plane;
         q7_t *dst = output;
         for (uint32_t p = 0; p < npix; p++) {{
             for (b = 0; b < nb; b++) dst[b] = gp[b][p];
             dst += input_ch;
         }}
+#else
+        {{
+            const uint32_t nb4 = nb & ~3u;
+            uint32_t p = 0;
+            for (; p + 4 <= npix; p += 4) {{
+                q7_t *d = output + (size_t)p * input_ch;
+                for (b = 0; b < nb4; b += 4) {{
+                    const q7_t *pl = cols_8b_start + (size_t)b * plane + p;
+                    q31_t q0, q1, q2, q3;
+                    dw_transpose4(arm_nn_read_q7x4(pl), arm_nn_read_q7x4(pl + plane), arm_nn_read_q7x4(pl + 2 * (size_t)plane),
+                                  arm_nn_read_q7x4(pl + 3 * (size_t)plane), &q0, &q1, &q2, &q3);
+                    dw_st32(d + b, q0);
+                    dw_st32(d + input_ch + b, q1);
+                    dw_st32(d + 2 * (size_t)input_ch + b, q2);
+                    dw_st32(d + 3 * (size_t)input_ch + b, q3);
+                }}
+                for (b = nb4; b < nb; b++) {{
+                    const q7_t *pl = cols_8b_start + (size_t)b * plane + p;
+                    d[b] = pl[0]; d[input_ch + b] = pl[1]; d[2 * (size_t)input_ch + b] = pl[2]; d[3 * (size_t)input_ch + b] = pl[3];
+                }}
+            }}
+            for (; p < npix; p++) {{
+                q7_t *d = output + (size_t)p * input_ch;
+                for (b = 0; b < nb; b++) d[b] = cols_8b_start[(size_t)b * plane + p];
+            }}
+        }}
+#endif
         input += nb;
         output += nb;
     }}
@@ -546,7 +632,7 @@ class depthwiseInplace:
                 "    const q31_t rs = RIGHT_SHIFT(*shift);\n"
                 "    const q31_t rhalf = (q31_t)(((uint32_t)1 << rs) >> 1);\n"
                 "    #define DW_REQ(v) (fast ? ({ q31_t acc_ = (v) + post; "
-                "q31_t hi_ = (q31_t)((((q63_t)acc_ * mult) + (1 << 30)) >> 31); "
+                "q31_t hi_ = DW_HI(acc_, mult); "
                 "q31_t r_ = rs ? (hi_ + rhalf + (hi_ >> 31)) >> rs : hi_; __SSAT(r_ + output_offset, 8); }) "
                 ": ({ q31_t r_ = arm_nn_divide_by_power_of_two("
                 "arm_nn_doubling_high_mult_no_sat(((v) + post) * lsm, mult), rs); "
@@ -660,7 +746,7 @@ class depthwiseInplace:
             # fast: every shift <= 0 and the clamp is the int8 range, so the requantize is a right shift and the clamp one
             # SSAT (same result as the generic line, about 14 instructions fewer). `fast` is a constant in each copy.
             req = ("(fast ? ({ q31_t acc_ = (v) + post; "
-                   "q31_t hi_ = (q31_t)((((q63_t)acc_ * mult) + (1 << 30)) >> 31); "
+                   "q31_t hi_ = DW_HI(acc_, mult); "
                    "q31_t r_ = rs ? (hi_ + rhalf + (hi_ >> 31)) >> rs : hi_; __SSAT(r_ + output_offset, 8); }) "
                    ": ({ q31_t r_ = arm_nn_divide_by_power_of_two("
                    "arm_nn_doubling_high_mult_no_sat(((v) + post) * lsm, mult), rs); "
