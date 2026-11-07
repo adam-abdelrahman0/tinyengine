@@ -64,7 +64,11 @@ __STATIC_FORCEINLINE q31_t te_requantize_s8(const q31_t acc, const q31_t multipl
                                             const q31_t out_offset)
 {
     const q31_t right = -shift;
+#ifdef TE_NO_SMMULR /* sweep: the 64-bit multiply-accumulate form used before SMMULR */
+    const q31_t hi = (q31_t)((((q63_t)acc * multiplier) + (1 << 30)) >> 31);
+#else
     const q31_t hi = te_smmulr(acc * 2, multiplier);
+#endif
     const q31_t r = right ? (hi + (q31_t)(((uint32_t)1 << right) >> 1) + (hi >> 31)) >> right : hi;
     return __SSAT(r + out_offset, 8);
 }

@@ -27,12 +27,20 @@
 #include "arm_math.h"
 #include "tinyengine_function.h"
 
-/* Four channels per iteration with the loads first (see add_fpreq.c): the dependent float chains of neighbouring elements
- * overlap instead of stalling the in-order pipeline. Same arithmetic per element. */
+/* TE_FPREQ_UNROLL channels per iteration (default 4) with the loads first (see add_fpreq.c): the dependent float chains of
+ * neighbouring elements overlap instead of stalling the in-order pipeline. Same arithmetic per element. */
+#ifndef TE_FPREQ_UNROLL
+#define TE_FPREQ_UNROLL 4
+#endif
+#ifdef TE_FPREQ_ROUND_DOUBLE
+#define FPREQ_ROUND(x) round(x)
+#else
+#define FPREQ_ROUND(x) roundf(x)
+#endif
 #define MUL_BC_ELEM(x8, s8)                                                                      \
   ({ float xf = ((float)(x8) - input_zero) * input_scale;                                        \
      float sf = ((float)(s8) - scaler_zero) * scaler_scale;                                      \
-     int o = (int)roundf((xf * sf) / output_scale + zero_y);                                     \
+     int o = (int)FPREQ_ROUND((xf * sf) / output_scale + zero_y);                                \
      o = TN_MAX(o, -128);                                                                        \
      TN_MIN(o, 127); })
 
@@ -43,19 +51,17 @@ tinyengine_status mul_fpreq_broadcast(int size, const int8_t* input_data, const 
 
   for (int hw = 0; hw < hw_count; hw++) {
     int c = 0;
-    for (; c + 3 < scaler_size; c += 4) {
-      const int8_t x0 = input_data[0], x1 = input_data[1], x2 = input_data[2], x3 = input_data[3];
-      const int8_t s0 = scaler_data[c], s1 = scaler_data[c + 1], s2 = scaler_data[c + 2], s3 = scaler_data[c + 3];
-      const int o0 = MUL_BC_ELEM(x0, s0);
-      const int o1 = MUL_BC_ELEM(x1, s1);
-      const int o2 = MUL_BC_ELEM(x2, s2);
-      const int o3 = MUL_BC_ELEM(x3, s3);
-      input_data += 4;
-      output_data[0] = (int8_t)o0;
-      output_data[1] = (int8_t)o1;
-      output_data[2] = (int8_t)o2;
-      output_data[3] = (int8_t)o3;
-      output_data += 4;
+    for (; c + TE_FPREQ_UNROLL <= scaler_size; c += TE_FPREQ_UNROLL) {
+      int8_t x[TE_FPREQ_UNROLL], sc[TE_FPREQ_UNROLL];
+      int o[TE_FPREQ_UNROLL];
+#pragma GCC unroll 16
+      for (int k = 0; k < TE_FPREQ_UNROLL; k++) { x[k] = input_data[k]; sc[k] = scaler_data[c + k]; }
+#pragma GCC unroll 16
+      for (int k = 0; k < TE_FPREQ_UNROLL; k++) { o[k] = MUL_BC_ELEM(x[k], sc[k]); }
+      input_data += TE_FPREQ_UNROLL;
+#pragma GCC unroll 16
+      for (int k = 0; k < TE_FPREQ_UNROLL; k++) { output_data[k] = (int8_t)o[k]; }
+      output_data += TE_FPREQ_UNROLL;
     }
     for (; c < scaler_size; c++) {
       *output_data++ = (int8_t)MUL_BC_ELEM(*input_data++, scaler_data[c]);

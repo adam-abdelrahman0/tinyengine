@@ -20,13 +20,23 @@
 #include "arm_math.h"
 #include "tinyengine_function.h"
 
-/* Each element is one long chain of dependent float operations and the Cortex-M7 cannot reorder them, so four elements
- * are done per iteration, all loads first: the chains overlap and the stalls disappear. Same arithmetic per element.
- * Inputs and output may overlap element for element (in-place), which is why a block's loads precede its stores. */
+/* Each element is one long chain of dependent float operations and the Cortex-M7 cannot reorder them, so
+ * TE_FPREQ_UNROLL elements are done per iteration (default 4), all loads first: the chains overlap and the stalls
+ * disappear. Same arithmetic per element. Inputs and output may overlap element for element (in-place), which is why a
+ * block's loads precede its stores. TE_FPREQ_UNROLL=1 is the original loop; TE_FPREQ_ROUND_DOUBLE uses round() (double)
+ * instead of roundf() (identical results). Both are swept by Data_Scripts/sweeps. */
+#ifndef TE_FPREQ_UNROLL
+#define TE_FPREQ_UNROLL 4
+#endif
+#ifdef TE_FPREQ_ROUND_DOUBLE
+#define FPREQ_ROUND(x) round(x)
+#else
+#define FPREQ_ROUND(x) roundf(x)
+#endif
 #define ADD_FPREQ_ELEM(a8, b8)                                                                     \
   ({ float fa = ((float)(a8) - input1_zero) * input1_scale;                                        \
      float fb = ((float)(b8) - input2_zero) * input2_scale;                                        \
-     int o = (int)roundf((fa + fb) / output_scale + zero_y); /* == round() of the float, single precision */\
+     int o = (int)FPREQ_ROUND((fa + fb) / output_scale + zero_y); /* to align with tvm implementation */ \
      o = TN_MAX(o, -128);                                                                          \
      TN_MIN(o, 127); })
 
@@ -34,17 +44,15 @@ tinyengine_status add_fpreq(int size, const int8_t* input1_data, const float inp
 			const int8_t* input2_data, const float input2_scale, const float input2_zero, const float output_scale,
 			const float zero_y, int8_t* output_data) {
   int i = 0;
-  for (; i + 3 < size; i += 4) {
-    const int8_t a0 = input1_data[i], a1 = input1_data[i + 1], a2 = input1_data[i + 2], a3 = input1_data[i + 3];
-    const int8_t b0 = input2_data[i], b1 = input2_data[i + 1], b2 = input2_data[i + 2], b3 = input2_data[i + 3];
-    const int o0 = ADD_FPREQ_ELEM(a0, b0);
-    const int o1 = ADD_FPREQ_ELEM(a1, b1);
-    const int o2 = ADD_FPREQ_ELEM(a2, b2);
-    const int o3 = ADD_FPREQ_ELEM(a3, b3);
-    output_data[i] = (int8_t)o0;
-    output_data[i + 1] = (int8_t)o1;
-    output_data[i + 2] = (int8_t)o2;
-    output_data[i + 3] = (int8_t)o3;
+  for (; i + TE_FPREQ_UNROLL <= size; i += TE_FPREQ_UNROLL) {
+    int8_t a[TE_FPREQ_UNROLL], b[TE_FPREQ_UNROLL];
+    int o[TE_FPREQ_UNROLL];
+#pragma GCC unroll 16
+    for (int k = 0; k < TE_FPREQ_UNROLL; k++) { a[k] = input1_data[i + k]; b[k] = input2_data[i + k]; }
+#pragma GCC unroll 16
+    for (int k = 0; k < TE_FPREQ_UNROLL; k++) { o[k] = ADD_FPREQ_ELEM(a[k], b[k]); }
+#pragma GCC unroll 16
+    for (int k = 0; k < TE_FPREQ_UNROLL; k++) { output_data[i + k] = (int8_t)o[k]; }
   }
   for (; i < size; ++i) {
     output_data[i] = (int8_t)ADD_FPREQ_ELEM(input1_data[i], input2_data[i]);

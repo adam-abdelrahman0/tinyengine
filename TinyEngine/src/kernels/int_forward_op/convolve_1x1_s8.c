@@ -22,6 +22,11 @@
 #include "te_requant.h"
 #include "tinyengine_function.h"
 
+/* pixels below which the pre-expanded path is not worth its weight expansion (default 16; swept by Data_Scripts/sweeps) */
+#ifndef TE_XW_MIN_PIXELS
+#define TE_XW_MIN_PIXELS 16
+#endif
+
 #define DIM_KER_X (1U)
 #define DIM_KER_Y (1U)
 
@@ -59,12 +64,12 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x,
 	const int xw_rows = te_conv1x1_xw_rows(wspace_bytes, input_ch);
 	/* tiled mode uses all of sbuf, im2col columns included */
 	const size_t tile_bytes = (runtime_buf == te_sbuf_base) ? ((size_t) SBuffer_size & ~(size_t) 7) : 0;
-	if (fast && output_ch % 2 == 0 && num_elements >= 16 && xw_rows >= output_ch) {
+	if (fast && output_ch % 2 == 0 && num_elements >= TE_XW_MIN_PIXELS && xw_rows >= output_ch) {
 		te_conv1x1_pairs_xw(input, input_ch, kernel, bias, output_shift, output_mult, out_offset, input_offset, output,
 				num_elements / 2, output_ch, runtime_buf, wspace, wspace_bytes);
 		pairs_done = num_elements / 2;
 		out += (size_t) pairs_done * 2 * output_ch;
-	} else if (fast && output_ch % 2 == 0 && num_elements >= 16 && te_conv1x1_xw_tiled_ok(tile_bytes, num_elements / 2, input_ch)) {
+	} else if (fast && output_ch % 2 == 0 && num_elements >= TE_XW_MIN_PIXELS && te_conv1x1_xw_tiled_ok(tile_bytes, num_elements / 2, input_ch)) {
 		te_conv1x1_pairs_xw_tiled(input, input_ch, kernel, bias, output_shift, output_mult, out_offset, input_offset, output,
 				num_elements / 2, output_ch, (q31_t *) runtime_buf, tile_bytes);
 		pairs_done = num_elements / 2;

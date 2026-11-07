@@ -49,6 +49,12 @@ tinyengine_status mul_fpreq_inplace(int size, int8_t* data, const float scale, c
       o = TN_MAX(o, -128); o = TN_MIN(o, 127);
       lut[b] = (uint8_t) (int8_t) o;
     }
+#ifdef TE_INPLACE_BYTE_LUT /* sweep: the earlier byte-at-a-time table loop */
+    for (; i + 3 < size; i += 4) {
+      const uint8_t a = lut[(uint8_t) data[i]], b = lut[(uint8_t) data[i + 1]], c = lut[(uint8_t) data[i + 2]], d = lut[(uint8_t) data[i + 3]];
+      data[i] = (int8_t) a; data[i + 1] = (int8_t) b; data[i + 2] = (int8_t) c; data[i + 3] = (int8_t) d;
+    }
+#else
     /* one word load and store per four elements (the byte loop was bound by a store per element that could alias the
      * next load); little endian, element i in the low byte */
     for (; i + 3 < size; i += 4) {
@@ -58,6 +64,7 @@ tinyengine_status mul_fpreq_inplace(int size, int8_t* data, const float scale, c
                        | ((uint32_t) lut[(v >> 16) & 0xFF] << 16) | ((uint32_t) lut[v >> 24] << 24);
       memcpy(data + i, &o, 4);
     }
+#endif
   }
 
   for (; i + 1 < size; i += 2) {

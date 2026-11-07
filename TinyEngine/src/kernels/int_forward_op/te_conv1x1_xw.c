@@ -34,7 +34,21 @@
 #include "te_requant.h"
 #include "tinyengine_function.h"
 
-#define TE_XW_TILE 16 /* pixel pairs per tile: the weight expansion costs 1/TE_XW_TILE of the multiply work */
+/* Tunables (all -D at build time; the defaults are what ships). tinyengine_bench.py passes TE_EXTRA_DEFINES through, and
+ * Data_Scripts/sweeps/ measures each one on the board.
+ *   TE_XW_TILE       pixel pairs per tile: the weight expansion costs 1/TE_XW_TILE of the multiply work (default 16)
+ *   TE_XW_TILE_DIV   the tile buffer may take 1/TE_XW_TILE_DIV of the workspace (default 2)
+ *   TE_XW_NO_QUAD    use the 2 x 2 pair kernel only (no 2 x 4 block); also disables the stem path
+ *   TE_XW_GROUP_UNROLL  groups of 4 input channels per quad-loop iteration, 1 or 2 (default 2) */
+#ifndef TE_XW_TILE
+#define TE_XW_TILE 16
+#endif
+#ifndef TE_XW_TILE_DIV
+#define TE_XW_TILE_DIV 2
+#endif
+#ifndef TE_XW_GROUP_UNROLL
+#define TE_XW_GROUP_UNROLL 2
+#endif
 
 /* number of weight rows (even, >= 2) whose expanded copy fits the workspace; 0 if even two rows do not */
 int te_conv1x1_xw_rows(const size_t wspace_bytes, const uint16_t input_ch)
@@ -46,7 +60,7 @@ int te_conv1x1_xw_rows(const size_t wspace_bytes, const uint16_t input_ch)
 static int xw_tile_pairs(const size_t wspace_bytes, const int num_pairs, const uint16_t input_ch)
 {
     const size_t pair_bytes = 4U * input_ch;
-    size_t tp = (wspace_bytes / 2) / pair_bytes; /* at most half the workspace for the tile */
+    size_t tp = (wspace_bytes / TE_XW_TILE_DIV) / pair_bytes; /* at most 1/TE_XW_TILE_DIV of the workspace for the tile */
     if (tp > TE_XW_TILE) tp = TE_XW_TILE;
     if (tp > (size_t)num_pairs) tp = num_pairs;
     if (tp < 1 || wspace_bytes < tp * pair_bytes + 2U * 2U * input_ch) return 0;
@@ -170,7 +184,7 @@ static inline void xw_compute_quad(const q31_t *wblk, const q31_t *bcol, const i
     for (int r = row0; r < row0 + rows; r += 2)
     {
         const uint64_t *b = (const uint64_t *)bcol;
-        const uint64_t *const b_end = b + 8 * (groups >> 1); /* two groups per iteration: halves the loop overhead */
+        const uint64_t *const b_end = b + 8 * (groups >> 1); /* TE_XW_GROUP_UNROLL 2: two groups per iteration halves the loop overhead */
         q31_t a00 = bias[r], a01 = bias[r], a02 = bias[r], a03 = bias[r];
         q31_t a10 = bias[r + 1], a11 = bias[r + 1], a12 = bias[r + 1], a13 = bias[r + 1];
 #define XW_QUAD_GROUP(WO, BO)                                  \
@@ -200,6 +214,7 @@ static inline void xw_compute_quad(const q31_t *wblk, const q31_t *bcol, const i
         a12 = __SMLAD(w3, (q31_t)bv, a12);                     \
         a13 = __SMLAD(w3, (q31_t)(bv >> 32), a13);             \
     }
+#if TE_XW_GROUP_UNROLL == 2
         while (b != b_end)
         {
             XW_QUAD_GROUP(0, 0)
@@ -212,6 +227,14 @@ static inline void xw_compute_quad(const q31_t *wblk, const q31_t *bcol, const i
             XW_QUAD_GROUP(0, 0)
             w += 2;
         }
+#else
+        for (int g = 0; g < groups; g++)
+        {
+            XW_QUAD_GROUP(0, 0)
+            w += 2;
+            b += 4;
+        }
+#endif
 #undef XW_QUAD_GROUP
         const int32_t m0 = output_mult[r], s0 = output_shift[r], m1 = output_mult[r + 1], s1 = output_shift[r + 1];
         q7_t *o = out + r;
@@ -248,12 +271,14 @@ void te_conv1x1_pairs_xw(const q7_t *input, const uint16_t input_ch, const q7_t 
         xw_expand_rows(wspace, kernel, row0, rows, groups, input_ch);
 
         int p = 0;
+#ifndef TE_XW_NO_QUAD
         for (; p + 2 <= num_pairs; p += 2)
         {
             xw_convert_quad((q31_t *)runtime_buf, input + (size_t)p * 2 * input_ch, groups, input_ch, offset_q15x2);
             xw_compute_quad(wspace, (const q31_t *)runtime_buf, groups, row0, rows, bias, output_shift, output_mult,
                             out_offset, output + (size_t)p * 2 * output_ch, output_ch);
         }
+#endif
         for (; p < num_pairs; p++)
         {
             xw_convert_pair((q31_t *)runtime_buf, input + (size_t)p * 2 * input_ch, groups, input_ch, offset_q15x2);
@@ -283,17 +308,22 @@ void te_conv1x1_pairs_xw_tiled(const q7_t *input, const uint16_t input_ch, const
     for (int p0 = 0; p0 < num_pairs; p0 += tp)
     {
         const int n = (num_pairs - p0) < tp ? (num_pairs - p0) : tp;
-        /* read every input of the tile before writing any output of it: quads first, then a leftover pair */
+        /* read every input of the tile before writing any output of it: quads first, then the leftover pairs (at most
+         * one, or all of them with TE_XW_NO_QUAD) */
+#ifdef TE_XW_NO_QUAD
+        const int nq = 0;
+#else
         const int nq = n / 2;
+#endif
         for (int q = 0; q < nq; q++)
         {
             xw_convert_quad(tile + (size_t)q * groups * 8, input + (size_t)(p0 + 2 * q) * 2 * input_ch, groups, input_ch,
                             offset_q15x2);
         }
-        if (n & 1)
+        for (int q = 2 * nq; q < n; q++)
         {
-            xw_convert_pair(tile + (size_t)nq * groups * 8, input + (size_t)(p0 + n - 1) * 2 * input_ch, groups, input_ch,
-                            offset_q15x2);
+            xw_convert_pair(tile + (size_t)nq * groups * 8 + (size_t)(q - 2 * nq) * groups * 4,
+                            input + (size_t)(p0 + q) * 2 * input_ch, groups, input_ch, offset_q15x2);
         }
         for (int row0 = 0; row0 < output_ch; row0 += block_rows)
         {
@@ -304,11 +334,11 @@ void te_conv1x1_pairs_xw_tiled(const q7_t *input, const uint16_t input_ch, const
                 xw_compute_quad(wblk, tile + (size_t)q * groups * 8, groups, row0, rows, bias, output_shift,
                                 output_mult, out_offset, output + (size_t)(p0 + 2 * q) * 2 * output_ch, output_ch);
             }
-            if (n & 1)
+            for (int q = 2 * nq; q < n; q++)
             {
-                q7_t *out_0 = output + (size_t)(p0 + n - 1) * 2 * output_ch + row0;
-                xw_compute_pair(wblk, tile + (size_t)nq * groups * 8, groups, row0, rows, bias, output_shift,
-                                output_mult, out_offset, out_0, out_0 + output_ch);
+                q7_t *out_0 = output + (size_t)(p0 + q) * 2 * output_ch + row0;
+                xw_compute_pair(wblk, tile + (size_t)nq * groups * 8 + (size_t)(q - 2 * nq) * groups * 4, groups, row0,
+                                rows, bias, output_shift, output_mult, out_offset, out_0, out_0 + output_ch);
             }
         }
     }
@@ -331,8 +361,12 @@ size_t te_stem_xw_bytes(const uint16_t output_x, const uint16_t output_ch)
 int te_stem_xw_ok(const uint16_t input_x, const uint16_t input_y, const uint16_t output_x, const uint16_t output_y,
                   const uint16_t output_ch, const size_t wspace_bytes)
 {
+#ifdef TE_XW_NO_QUAD
+    return 0; /* the stem path needs the 2 x 4 block */
+#else
     return input_x == 2 * output_x && input_y == 2 * output_y && output_x % 4 == 0 && output_ch % 2 == 0 &&
            te_stem_xw_bytes(output_x, output_ch) <= wspace_bytes;
+#endif
 }
 
 void te_stem_xw(const q7_t *input, const uint16_t input_x, const q7_t *kernel, const int32_t *bias,

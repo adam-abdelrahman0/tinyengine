@@ -34,7 +34,7 @@ tinyengine_status convolve_s8_kernel3_inputch3_stride2_pad1(const q7_t *input, c
 	const int kernel_y = 3;
 	const int kernel_x = 3;
 	const int fast = te_s8_fast_ok(output_shift, output_ch, output_activation_min, output_activation_max);
-#ifdef TE_DTCM
+#if defined(TE_DTCM) && !defined(TE_NO_STEM_XW) /* TE_NO_STEM_XW: keep the old stem for a sweep */
 	/* four output pixels at a time with the 2 x 4 block of te_conv1x1_xw.c, in the idle part of sbuf (see there) */
 	if (fast && input_ch == 3 && runtime_buf == te_sbuf_base
 			&& te_stem_xw_ok(input_x, input_y, output_x, output_y, output_ch, (size_t) SBuffer_size & ~(size_t) 7)) {
