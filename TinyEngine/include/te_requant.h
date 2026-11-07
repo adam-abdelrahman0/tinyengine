@@ -46,11 +46,25 @@ __STATIC_FORCEINLINE q31_t te_requantize(const q31_t val, const q31_t multiplier
  *     r = arm_nn_requantize(acc, mult, shift); r += out_offset; r = MIN(MAX(r, -128), 127);
  * about 14 instructions fewer per output (no left shift, no shift sign tests, no clamp compares or stack reloads).
  * te_s8_fast_ok() says whether a layer qualifies; callers fall back to the generic code if it does not. */
+/* (a * b + 2^31) >> 32 in one instruction (SMMULR); the C fallback is the same expression */
+__STATIC_FORCEINLINE q31_t te_smmulr(const q31_t a, const q31_t b)
+{
+#if defined(__arm__)
+    q31_t r;
+    __asm("smmulr %0, %1, %2" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+#else
+    return (q31_t)((((q63_t)a * b) + ((q63_t)1 << 31)) >> 32);
+#endif
+}
+
+/* hi = (acc * multiplier + 2^30) >> 31 == smmulr(2 * acc, multiplier); 2 * acc cannot overflow for |acc| < 2^30
+ * (conv accumulators are below about 2^27) */
 __STATIC_FORCEINLINE q31_t te_requantize_s8(const q31_t acc, const q31_t multiplier, const q31_t shift,
                                             const q31_t out_offset)
 {
     const q31_t right = -shift;
-    const q31_t hi = (q31_t)((((q63_t)acc * multiplier) + (1 << 30)) >> 31);
+    const q31_t hi = te_smmulr(acc * 2, multiplier);
     const q31_t r = right ? (hi + (q31_t)(((uint32_t)1 << right) >> 1) + (hi >> 31)) >> right : hi;
     return __SSAT(r + out_offset, 8);
 }

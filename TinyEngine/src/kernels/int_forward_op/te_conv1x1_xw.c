@@ -132,6 +132,102 @@ static inline void xw_compute_pair(const q31_t *wblk, const q31_t *bcol, const i
     }
 }
 
+/* four pixels (two pairs) at once: per group of 4 input channels 8 words, p0.x1 p1.x1 p2.x1 p3.x1 p0.x2 p1.x2 p2.x2 p3.x2.
+ * A 2-row x 4-pixel block does 32 MACs from 6 LDRD + 16 SMLAD (the 2 x 2 block: 16 MACs from 4 LDRD + 8 SMLAD), because the
+ * weight words are shared by four pixels. The Cortex-M7 issues these about one per cycle, so fewer instructions per MAC
+ * is the only lever. */
+static inline void xw_convert_quad(q31_t *dst, const q7_t *s0, const int groups, const uint16_t input_ch,
+                                   const q31_t offset_q15x2)
+{
+    const q7_t *s1 = s0 + input_ch;
+    const q7_t *s2 = s1 + input_ch;
+    const q7_t *s3 = s2 + input_ch;
+    for (int g = 0; g < groups; g++)
+    {
+        const q31_t u0 = arm_nn_read_q7x4(s0 + 4 * g);
+        const q31_t u1 = arm_nn_read_q7x4(s1 + 4 * g);
+        const q31_t u2 = arm_nn_read_q7x4(s2 + 4 * g);
+        const q31_t u3 = arm_nn_read_q7x4(s3 + 4 * g);
+        dst[0] = __SADD16(__SXTB16(u0), offset_q15x2);
+        dst[1] = __SADD16(__SXTB16(u1), offset_q15x2);
+        dst[2] = __SADD16(__SXTB16(u2), offset_q15x2);
+        dst[3] = __SADD16(__SXTB16(u3), offset_q15x2);
+        dst[4] = __SADD16(__SXTB16(__ROR(u0, 8)), offset_q15x2);
+        dst[5] = __SADD16(__SXTB16(__ROR(u1, 8)), offset_q15x2);
+        dst[6] = __SADD16(__SXTB16(__ROR(u2, 8)), offset_q15x2);
+        dst[7] = __SADD16(__SXTB16(__ROR(u3, 8)), offset_q15x2);
+        dst += 8;
+    }
+}
+
+/* output rows [row0, row0 + rows) of four pixels (the converted quad in bcol); out points at channel 0 of the first pixel */
+static inline void xw_compute_quad(const q31_t *wblk, const q31_t *bcol, const int groups, const int row0, const int rows,
+                                   const int32_t *bias, const int32_t *output_shift, const int32_t *output_mult,
+                                   const int32_t out_offset, q7_t *out, const int output_ch)
+{
+    const uint64_t *w = (const uint64_t *)wblk;
+    for (int r = row0; r < row0 + rows; r += 2)
+    {
+        const uint64_t *b = (const uint64_t *)bcol;
+        const uint64_t *const b_end = b + 8 * (groups >> 1); /* two groups per iteration: halves the loop overhead */
+        q31_t a00 = bias[r], a01 = bias[r], a02 = bias[r], a03 = bias[r];
+        q31_t a10 = bias[r + 1], a11 = bias[r + 1], a12 = bias[r + 1], a13 = bias[r + 1];
+#define XW_QUAD_GROUP(WO, BO)                                  \
+    {                                                          \
+        const uint64_t wa = w[WO];                             \
+        const q31_t w0 = (q31_t)wa, w1 = (q31_t)(wa >> 32);    \
+        uint64_t bv = b[BO];                                   \
+        a00 = __SMLAD(w0, (q31_t)bv, a00);                     \
+        a01 = __SMLAD(w0, (q31_t)(bv >> 32), a01);             \
+        a10 = __SMLAD(w1, (q31_t)bv, a10);                     \
+        a11 = __SMLAD(w1, (q31_t)(bv >> 32), a11);             \
+        bv = b[BO + 1];                                        \
+        a02 = __SMLAD(w0, (q31_t)bv, a02);                     \
+        a03 = __SMLAD(w0, (q31_t)(bv >> 32), a03);             \
+        a12 = __SMLAD(w1, (q31_t)bv, a12);                     \
+        a13 = __SMLAD(w1, (q31_t)(bv >> 32), a13);             \
+        const uint64_t wb = w[WO + 1];                         \
+        const q31_t w2 = (q31_t)wb, w3 = (q31_t)(wb >> 32);    \
+        bv = b[BO + 2];                                        \
+        a00 = __SMLAD(w2, (q31_t)bv, a00);                     \
+        a01 = __SMLAD(w2, (q31_t)(bv >> 32), a01);             \
+        a10 = __SMLAD(w3, (q31_t)bv, a10);                     \
+        a11 = __SMLAD(w3, (q31_t)(bv >> 32), a11);             \
+        bv = b[BO + 3];                                        \
+        a02 = __SMLAD(w2, (q31_t)bv, a02);                     \
+        a03 = __SMLAD(w2, (q31_t)(bv >> 32), a03);             \
+        a12 = __SMLAD(w3, (q31_t)bv, a12);                     \
+        a13 = __SMLAD(w3, (q31_t)(bv >> 32), a13);             \
+    }
+        while (b != b_end)
+        {
+            XW_QUAD_GROUP(0, 0)
+            XW_QUAD_GROUP(2, 4)
+            w += 4;
+            b += 8;
+        }
+        if (groups & 1)
+        {
+            XW_QUAD_GROUP(0, 0)
+            w += 2;
+        }
+#undef XW_QUAD_GROUP
+        const int32_t m0 = output_mult[r], s0 = output_shift[r], m1 = output_mult[r + 1], s1 = output_shift[r + 1];
+        q7_t *o = out + r;
+        o[0] = (q7_t)te_requantize_s8(a00, m0, s0, out_offset);
+        o[1] = (q7_t)te_requantize_s8(a10, m1, s1, out_offset);
+        o += output_ch;
+        o[0] = (q7_t)te_requantize_s8(a01, m0, s0, out_offset);
+        o[1] = (q7_t)te_requantize_s8(a11, m1, s1, out_offset);
+        o += output_ch;
+        o[0] = (q7_t)te_requantize_s8(a02, m0, s0, out_offset);
+        o[1] = (q7_t)te_requantize_s8(a12, m1, s1, out_offset);
+        o += output_ch;
+        o[0] = (q7_t)te_requantize_s8(a03, m0, s0, out_offset);
+        o[1] = (q7_t)te_requantize_s8(a13, m1, s1, out_offset);
+    }
+}
+
 /* computes pixel pairs [0, num_pairs) of a 1x1 conv; pixel p reads input + p * input_ch, writes output + p * output_ch.
  * runtime_buf needs 2 * input_ch q15 (the interleaved activation columns). The expanded weights of one block of rows
  * (te_conv1x1_xw_rows()) must fit wspace; with several blocks the output must not overlap the input. */
@@ -150,7 +246,14 @@ void te_conv1x1_pairs_xw(const q7_t *input, const uint16_t input_ch, const q7_t 
         const int rows = (output_ch - row0) < block_rows ? (output_ch - row0) : block_rows;
         xw_expand_rows(wspace, kernel, row0, rows, groups, input_ch);
 
-        for (int p = 0; p < num_pairs; p++)
+        int p = 0;
+        for (; p + 2 <= num_pairs; p += 2)
+        {
+            xw_convert_quad((q31_t *)runtime_buf, input + (size_t)p * 2 * input_ch, groups, input_ch, offset_q15x2);
+            xw_compute_quad(wspace, (const q31_t *)runtime_buf, groups, row0, rows, bias, output_shift, output_mult,
+                            out_offset, output + (size_t)p * 2 * output_ch, output_ch);
+        }
+        for (; p < num_pairs; p++)
         {
             xw_convert_pair((q31_t *)runtime_buf, input + (size_t)p * 2 * input_ch, groups, input_ch, offset_q15x2);
             q7_t *out_0 = output + (size_t)p * 2 * output_ch + row0;
@@ -179,21 +282,32 @@ void te_conv1x1_pairs_xw_tiled(const q7_t *input, const uint16_t input_ch, const
     for (int p0 = 0; p0 < num_pairs; p0 += tp)
     {
         const int n = (num_pairs - p0) < tp ? (num_pairs - p0) : tp;
-        /* read every input of the tile before writing any output of it */
-        for (int q = 0; q < n; q++)
+        /* read every input of the tile before writing any output of it: quads first, then a leftover pair */
+        const int nq = n / 2;
+        for (int q = 0; q < nq; q++)
         {
-            xw_convert_pair(tile + (size_t)q * groups * 4, input + (size_t)(p0 + q) * 2 * input_ch, groups, input_ch,
+            xw_convert_quad(tile + (size_t)q * groups * 8, input + (size_t)(p0 + 2 * q) * 2 * input_ch, groups, input_ch,
+                            offset_q15x2);
+        }
+        if (n & 1)
+        {
+            xw_convert_pair(tile + (size_t)nq * groups * 8, input + (size_t)(p0 + n - 1) * 2 * input_ch, groups, input_ch,
                             offset_q15x2);
         }
         for (int row0 = 0; row0 < output_ch; row0 += block_rows)
         {
             const int rows = (output_ch - row0) < block_rows ? (output_ch - row0) : block_rows;
             xw_expand_rows(wblk, kernel, row0, rows, groups, input_ch);
-            for (int q = 0; q < n; q++)
+            for (int q = 0; q < nq; q++)
             {
-                q7_t *out_0 = output + (size_t)(p0 + q) * 2 * output_ch + row0;
-                xw_compute_pair(wblk, tile + (size_t)q * groups * 4, groups, row0, rows, bias, output_shift, output_mult,
-                                out_offset, out_0, out_0 + output_ch);
+                xw_compute_quad(wblk, tile + (size_t)q * groups * 8, groups, row0, rows, bias, output_shift,
+                                output_mult, out_offset, output + (size_t)(p0 + 2 * q) * 2 * output_ch, output_ch);
+            }
+            if (n & 1)
+            {
+                q7_t *out_0 = output + (size_t)(p0 + n - 1) * 2 * output_ch + row0;
+                xw_compute_pair(wblk, tile + (size_t)nq * groups * 8, groups, row0, rows, bias, output_shift,
+                                output_mult, out_offset, out_0, out_0 + output_ch);
             }
         }
     }

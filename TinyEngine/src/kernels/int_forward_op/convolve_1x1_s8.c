@@ -52,8 +52,8 @@ tinyengine_status convolve_1x1_s8(const q7_t *input, const uint16_t input_x,
 	/* weights pre-expanded to q15 (te_conv1x1_xw.c), in the idle part of sbuf, for layers with enough pixel pairs to repay the
 	 * expansion. If the whole layer's expanded weights fit, they are expanded once; if not, pixels are taken in tiles
 	 * (the tile's inputs are read before its outputs are written, so a layer whose output overwrites its input is fine). */
-	/* the workspace is the part of sbuf after this layer's two im2col columns (4 * input_ch bytes), if runtime_buf is sbuf */
-	const size_t wspace_off = 4 * (size_t) input_ch;
+	/* the workspace is the part of sbuf after this layer's pixel columns, if runtime_buf is sbuf */
+	const size_t wspace_off = 8 * (size_t) input_ch; /* the im2col columns (4 * input_ch) or one quad of pixels (8 * input_ch) */
 	const size_t wspace_bytes = (runtime_buf == te_sbuf_base && (size_t) SBuffer_size > wspace_off) ? ((size_t) SBuffer_size - wspace_off) & ~(size_t) 7 : 0;
 	q31_t *const wspace = (q31_t *) ((q7_t *) runtime_buf + wspace_off);
 	const int xw_rows = te_conv1x1_xw_rows(wspace_bytes, input_ch);
