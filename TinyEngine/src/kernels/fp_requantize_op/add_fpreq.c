@@ -20,17 +20,36 @@
 #include "arm_math.h"
 #include "tinyengine_function.h"
 
+/* Each element is one long chain of dependent float operations and the Cortex-M7 cannot reorder them, so four elements
+ * are done per iteration, all loads first: the chains overlap and the stalls disappear. Same arithmetic per element.
+ * Inputs and output may overlap element for element (in-place), which is why a block's loads precede its stores. */
+#define ADD_FPREQ_ELEM(a8, b8)                                                                     \
+  ({ float fa = ((float)(a8) - input1_zero) * input1_scale;                                        \
+     float fb = ((float)(b8) - input2_zero) * input2_scale;                                        \
+     int o = (int)round((fa + fb) / output_scale + zero_y); /* to align with tvm implementation */ \
+     o = TN_MAX(o, -128);                                                                          \
+     TN_MIN(o, 127); })
+
 tinyengine_status add_fpreq(int size, const int8_t* input1_data, const float input1_scale, const float input1_zero,
 			const int8_t* input2_data, const float input2_scale, const float input2_zero, const float output_scale,
 			const float zero_y, int8_t* output_data) {
-  for (int i = 0; i < size; ++i) {
-	  float input1_fp = ((float)*input1_data++ - input1_zero) * input1_scale;
-	  float input2_fp = ((float)*input2_data++ - input2_zero) * input2_scale;
-      int clamped_output = (int)round((input1_fp + input2_fp) / output_scale + zero_y); // to align with tvm implementation
-      clamped_output = TN_MAX(clamped_output, -128);
-      clamped_output = TN_MIN(clamped_output, 127);
-      output_data[i] = (int8_t)(clamped_output);
+  int i = 0;
+  for (; i + 3 < size; i += 4) {
+    const int8_t a0 = input1_data[i], a1 = input1_data[i + 1], a2 = input1_data[i + 2], a3 = input1_data[i + 3];
+    const int8_t b0 = input2_data[i], b1 = input2_data[i + 1], b2 = input2_data[i + 2], b3 = input2_data[i + 3];
+    const int o0 = ADD_FPREQ_ELEM(a0, b0);
+    const int o1 = ADD_FPREQ_ELEM(a1, b1);
+    const int o2 = ADD_FPREQ_ELEM(a2, b2);
+    const int o3 = ADD_FPREQ_ELEM(a3, b3);
+    output_data[i] = (int8_t)o0;
+    output_data[i + 1] = (int8_t)o1;
+    output_data[i + 2] = (int8_t)o2;
+    output_data[i + 3] = (int8_t)o3;
   }
+  for (; i < size; ++i) {
+    output_data[i] = (int8_t)ADD_FPREQ_ELEM(input1_data[i], input2_data[i]);
+  }
+  return STATE_SUCCESS;
 }
 
 const int activation_min = -128;

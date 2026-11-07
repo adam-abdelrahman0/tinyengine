@@ -29,6 +29,7 @@
  * -------------------------------------------------------------------- */
 
 #include <math.h>
+#include <string.h>
 #include "arm_math.h"
 #include "tinyengine_function.h"
 
@@ -41,17 +42,21 @@ tinyengine_status mul_fpreq_inplace(int size, int8_t* data, const float scale, c
    * formula once per possible value (same expression as the loops below) and look every element up instead:
    * about 2 cycles per element against about 23 for the float math. */
   if (size >= 256) {
-    int8_t lut[256];
-    for (int q = -128; q < 128; q++) {
-      const float v = ((float) q - zero) * scale;
+    uint8_t lut[256]; /* indexed by the raw byte, so no sign adjustment per element */
+    for (int b = 0; b < 256; b++) {
+      const float v = ((float) (int8_t) b - zero) * scale;
       int32_t o = (int32_t) roundf(v * v * inv_output_scale + zero_y);
       o = TN_MAX(o, -128); o = TN_MIN(o, 127);
-      lut[q + 128] = (int8_t) o;
+      lut[b] = (uint8_t) (int8_t) o;
     }
-    const int8_t* t = lut + 128;
+    /* one word load and store per four elements (the byte loop was bound by a store per element that could alias the
+     * next load); little endian, element i in the low byte */
     for (; i + 3 < size; i += 4) {
-      const int8_t a = t[data[i]], b = t[data[i + 1]], c = t[data[i + 2]], d = t[data[i + 3]];
-      data[i] = a; data[i + 1] = b; data[i + 2] = c; data[i + 3] = d;
+      uint32_t v;
+      memcpy(&v, data + i, 4);
+      const uint32_t o = (uint32_t) lut[v & 0xFF] | ((uint32_t) lut[(v >> 8) & 0xFF] << 8)
+                       | ((uint32_t) lut[(v >> 16) & 0xFF] << 16) | ((uint32_t) lut[v >> 24] << 24);
+      memcpy(data + i, &o, 4);
     }
   }
 
