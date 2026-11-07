@@ -214,7 +214,8 @@ extern "C" {
                                              const int16_t activation_max,
                                              const uint16_t num_col_a,
                                              const int32_t *const output_bias,
-                                             q7_t *out_0);
+                                             q7_t *out_0,
+                                             const int fast);
                                              
     q7_t *arm_nn_mat_mult_kernel_s8_s16_reordered_8mul(const q7_t *input_a,
                                                        const q15_t *input_b,

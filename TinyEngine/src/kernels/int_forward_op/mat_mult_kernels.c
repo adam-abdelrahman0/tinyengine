@@ -17,6 +17,7 @@
  * -------------------------------------------------------------------- */
 
 #include "arm_nnsupportfunctions.h"
+#include "te_requant.h"
 #include "tinyengine_lib.h"
 
 
@@ -30,7 +31,8 @@ q7_t *mat_mult_kernel_s8_s16_preprocessed_ch24(const q31_t *input_a,
                                              const int16_t activation_max,
                                              const uint16_t num_col_a,
                                              const int32_t *const output_bias,
-                                             q7_t *out_0)
+                                             q7_t *out_0,
+                                             const int fast)
 {
     /* set up the second output pointers */
     q7_t *out_1 = out_0 + output_ch;
@@ -200,30 +202,58 @@ q7_t *mat_mult_kernel_s8_s16_preprocessed_ch24(const q31_t *input_a,
         // ========================================================
         // Requantization, Activation, and Store
         // ========================================================
-        ch_0_out_0 = arm_nn_requantize(ch_0_out_0, *out_mult, *out_shift);
-        ch_0_out_0 += out_offset;
-        ch_0_out_0 = MAX(ch_0_out_0, activation_min);
-        ch_0_out_0 = MIN(ch_0_out_0, activation_max);
+        if (fast)
+        {
+            ch_0_out_0 = te_requantize_s8(ch_0_out_0, *out_mult, *out_shift, out_offset);
+        }
+        else
+        {
+            ch_0_out_0 = arm_nn_requantize(ch_0_out_0, *out_mult, *out_shift);
+            ch_0_out_0 += out_offset;
+            ch_0_out_0 = MAX(ch_0_out_0, activation_min);
+            ch_0_out_0 = MIN(ch_0_out_0, activation_max);
+        }
         *out_0++ = (q7_t)ch_0_out_0;
 
-        ch_0_out_1 = arm_nn_requantize(ch_0_out_1, *out_mult, *out_shift);
-        ch_0_out_1 += out_offset;
-        ch_0_out_1 = MAX(ch_0_out_1, activation_min);
-        ch_0_out_1 = MIN(ch_0_out_1, activation_max);
+        if (fast)
+        {
+            ch_0_out_1 = te_requantize_s8(ch_0_out_1, *out_mult, *out_shift, out_offset);
+        }
+        else
+        {
+            ch_0_out_1 = arm_nn_requantize(ch_0_out_1, *out_mult, *out_shift);
+            ch_0_out_1 += out_offset;
+            ch_0_out_1 = MAX(ch_0_out_1, activation_min);
+            ch_0_out_1 = MIN(ch_0_out_1, activation_max);
+        }
         *out_1++ = (q7_t)ch_0_out_1;
         out_mult++;
         out_shift++;
 
-        ch_1_out_0 = arm_nn_requantize(ch_1_out_0, *out_mult, *out_shift);
-        ch_1_out_0 += out_offset;
-        ch_1_out_0 = MAX(ch_1_out_0, activation_min);
-        ch_1_out_0 = MIN(ch_1_out_0, activation_max);
+        if (fast)
+        {
+            ch_1_out_0 = te_requantize_s8(ch_1_out_0, *out_mult, *out_shift, out_offset);
+        }
+        else
+        {
+            ch_1_out_0 = arm_nn_requantize(ch_1_out_0, *out_mult, *out_shift);
+            ch_1_out_0 += out_offset;
+            ch_1_out_0 = MAX(ch_1_out_0, activation_min);
+            ch_1_out_0 = MIN(ch_1_out_0, activation_max);
+        }
         *out_0++ = (q7_t)ch_1_out_0;
 
-        ch_1_out_1 = arm_nn_requantize(ch_1_out_1, *out_mult, *out_shift);
-        ch_1_out_1 += out_offset;
-        ch_1_out_1 = MAX(ch_1_out_1, activation_min);
-        ch_1_out_1 = MIN(ch_1_out_1, activation_max);
+        if (fast)
+        {
+            ch_1_out_1 = te_requantize_s8(ch_1_out_1, *out_mult, *out_shift, out_offset);
+        }
+        else
+        {
+            ch_1_out_1 = arm_nn_requantize(ch_1_out_1, *out_mult, *out_shift);
+            ch_1_out_1 += out_offset;
+            ch_1_out_1 = MAX(ch_1_out_1, activation_min);
+            ch_1_out_1 = MIN(ch_1_out_1, activation_max);
+        }
         *out_1++ = (q7_t)ch_1_out_1;
         out_mult++;
         out_shift++;

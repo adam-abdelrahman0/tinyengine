@@ -241,6 +241,11 @@ void te_conv1x1_pairs_xw(const q7_t *input, const uint16_t input_ch, const q7_t 
                          const int32_t *output_shift, const int32_t *output_mult, const int32_t out_offset,
                          const int32_t input_offset, q7_t *output, const int32_t num_pairs, const uint16_t output_ch,
                          q15_t *runtime_buf, q31_t *wspace, const size_t wspace_bytes);
+int te_conv1x1_xw_tiled_ok(const size_t wspace_bytes, const int num_pairs, const uint16_t input_ch);
+void te_conv1x1_pairs_xw_tiled(const q7_t *input, const uint16_t input_ch, const q7_t *kernel, const int32_t *bias,
+                               const int32_t *output_shift, const int32_t *output_mult, const int32_t out_offset,
+                               const int32_t input_offset, q7_t *output, const int32_t num_pairs,
+                               const uint16_t output_ch, q31_t *wspace, const size_t wspace_bytes);
 #endif
 
 // fused 1x1 conv + StarBlockV self-gate square: relu6(conv(x))^2 in one

@@ -19,6 +19,7 @@
 #include "arm_nnfunctions.h"
 #include "arm_nnsupportfunctions.h"
 #include "img2col_element.h"
+#include "te_requant.h"
 #include "tinyengine_function.h"
 
 #define DIM_KER_X (1U)
@@ -80,6 +81,8 @@ tinyengine_status convolve_1x1_s8_ch24(const q7_t *input, const uint16_t input_x
 	/* pre-widened weights: the preprocessed kernel is unrolled for 24 input channels and needs an even output_ch. Its
 	 * workspace is the part of sbuf after this call's two im2col columns (4 * input_ch bytes), which nothing else uses
 	 * while the layer runs; without it (no TE_DTCM, or too small) the original kernel runs on the raw weights. */
+	/* right-shift-only requantize + SSAT clamp when the layer allows it (see te_requant.h) */
+	const int fast = te_s8_fast_ok(output_shift, output_ch, out_activation_min, out_activation_max);
 	int use_prepacked = 0;
 #ifdef TE_DTCM
 	const size_t wspace_off = 4 * (size_t) input_ch;
@@ -120,7 +123,7 @@ tinyengine_status convolve_1x1_s8_ch24(const q7_t *input, const uint16_t input_x
 					two_column_buffer, output_ch, output_shift, output_mult,
 					(q7_t) out_offset, out_activation_min,
 					out_activation_max, input_ch * DIM_KER_Y * DIM_KER_X,
-					bias, out);
+					bias, out, fast);
 			continue;
 		}
 #endif
