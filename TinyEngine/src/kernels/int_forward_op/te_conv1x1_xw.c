@@ -28,6 +28,7 @@
 
 #ifdef TE_DTCM
 
+#include <string.h>
 #include "arm_nnfunctions.h"
 #include "arm_nnsupportfunctions.h"
 #include "te_requant.h"
@@ -309,6 +310,85 @@ void te_conv1x1_pairs_xw_tiled(const q7_t *input, const uint16_t input_ch, const
                 xw_compute_pair(wblk, tile + (size_t)nq * groups * 8, groups, row0, rows, bias, output_shift,
                                 output_mult, out_offset, out_0, out_0 + output_ch);
             }
+        }
+    }
+}
+
+/* ---- stem: 3x3 stride-2 pad-1 conv over a 3-channel image, as a 1x1-style product with the quad kernel ----
+ * A patch is 27 values (3 rows x 3 pixels x 3 channels, contiguous in HWC). It is padded to 28 with a zero weight so it is
+ * seven groups of four, and the same 2 x 4 block that runs the 1x1 layers computes four output pixels at once, against
+ * weights expanded once. Requires input_x == 2 * output_x, input_y == 2 * output_y (so only the top/left edge is padded),
+ * output_x % 4 == 0 and an even output_ch. Workspace bytes needed: te_stem_xw_bytes(). */
+#define STEM_PATCH 28
+
+size_t te_stem_xw_bytes(const uint16_t output_x, const uint16_t output_ch)
+{
+    /* padded kernel, expanded weights, one row of patches, one converted quad (each region 8-byte aligned) */
+    return (size_t)output_ch * STEM_PATCH + (size_t)output_ch * STEM_PATCH * 2 + (size_t)output_x * STEM_PATCH
+           + (STEM_PATCH / 4) * 32 + 4 * 8;
+}
+
+int te_stem_xw_ok(const uint16_t input_x, const uint16_t input_y, const uint16_t output_x, const uint16_t output_y,
+                  const uint16_t output_ch, const size_t wspace_bytes)
+{
+    return input_x == 2 * output_x && input_y == 2 * output_y && output_x % 4 == 0 && output_ch % 2 == 0 &&
+           te_stem_xw_bytes(output_x, output_ch) <= wspace_bytes;
+}
+
+void te_stem_xw(const q7_t *input, const uint16_t input_x, const q7_t *kernel, const int32_t *bias,
+                const int32_t *output_shift, const int32_t *output_mult, const int32_t out_offset,
+                const int32_t input_offset, q7_t *output, const uint16_t output_x, const uint16_t output_y,
+                const uint16_t output_ch, q31_t *wspace, const q7_t pad_value)
+{
+    const int groups = STEM_PATCH / 4;
+    const int16_t inoff16 = input_offset;
+    const q31_t offset_q15x2 = __PKHBT(inoff16, inoff16, 16);
+
+    q7_t *kpad = (q7_t *)wspace;
+    q31_t *wblk = (q31_t *)((q7_t *)kpad + (((size_t)output_ch * STEM_PATCH + 7) & ~(size_t)7));
+    q7_t *patch = (q7_t *)wblk + (((size_t)output_ch * STEM_PATCH * 2 + 7) & ~(size_t)7);
+    q31_t *qbuf = (q31_t *)(patch + (((size_t)output_x * STEM_PATCH + 7) & ~(size_t)7));
+
+    for (int r = 0; r < output_ch; r++)
+    {
+        memcpy(kpad + (size_t)r * STEM_PATCH, kernel + (size_t)r * 27, 27);
+        kpad[(size_t)r * STEM_PATCH + 27] = 0;
+    }
+    xw_expand_rows(wblk, kpad, 0, output_ch, groups, STEM_PATCH);
+
+    for (int oy = 0; oy < output_y; oy++)
+    {
+        /* one output row of patches */
+        for (int ox = 0; ox < output_x; ox++)
+        {
+            q7_t *pt = patch + (size_t)ox * STEM_PATCH;
+            const int ix0 = 2 * ox - 1;
+            for (int ky = 0; ky < 3; ky++)
+            {
+                const int iy = 2 * oy - 1 + ky;
+                if (iy < 0)
+                {
+                    memset(pt, pad_value, 9);
+                }
+                else if (ix0 < 0)
+                {
+                    memset(pt, pad_value, 3);
+                    memcpy(pt + 3, input + ((size_t)iy * input_x) * 3, 6);
+                }
+                else
+                {
+                    memcpy(pt, input + ((size_t)iy * input_x + ix0) * 3, 9);
+                }
+                pt += 9;
+            }
+            *pt = 0;
+        }
+        q7_t *out_row = output + (size_t)oy * output_x * output_ch;
+        for (int ox = 0; ox < output_x; ox += 4)
+        {
+            xw_convert_quad(qbuf, patch + (size_t)ox * STEM_PATCH, groups, STEM_PATCH, offset_q15x2);
+            xw_compute_quad(wblk, qbuf, groups, 0, output_ch, bias, output_shift, output_mult, out_offset,
+                            out_row + (size_t)ox * output_ch, output_ch);
         }
     }
 }
